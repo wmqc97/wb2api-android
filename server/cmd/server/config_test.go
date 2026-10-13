@@ -1,0 +1,1980 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
+)
+
+func TestDefault(t *testing.T) {
+	c := Default()
+	if c.Listen != ":7863" {
+		t.Errorf("listen=%s", c.Listen)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.SoftRateDur.Seconds() != 600 {
+		t.Errorf("soft=%v want 600s", c.SoftRateDur)
+	}
+}
+
+func TestLoggingDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Logging.RequestArchiveEnabled || c.Logging.RequestRetentionDays != 7 || c.Logging.RequestArchiveMaxMB != 100 {
+		t.Fatalf("logging defaults = %+v", c.Logging)
+	}
+	// 来源记录（IP/UA）缺省开启：键缺席时必须保持 true，只有显式 false 才关闭。
+	if !c.Logging.RequestClientInfo {
+		t.Fatalf("request_client_info default = false, want true: %+v", c.Logging)
+	}
+	configured, err := ParseConfig([]byte(`{"logging":{"request_archive_enabled":false,"request_retention_days":30,"request_archive_max_mb":500}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.Logging.RequestArchiveEnabled || configured.Logging.RequestRetentionDays != 30 || configured.Logging.RequestArchiveMaxMB != 500 {
+		t.Fatalf("configured logging = %+v", configured.Logging)
+	}
+	off, err := ParseConfig([]byte(`{"logging":{"request_client_info":false}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Logging.RequestClientInfo {
+		t.Fatalf("explicit false ignored: %+v", off.Logging)
+	}
+	fallback, err := ParseConfig([]byte(`{"logging":{"request_retention_days":0,"request_archive_max_mb":0}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.Logging.RequestRetentionDays != 7 || fallback.Logging.RequestArchiveMaxMB != 100 {
+		t.Fatalf("logging fallback = %+v", fallback.Logging)
+	}
+}
+
+func TestLoadFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"listen":":9999","api_key":"k"}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen != ":9999" || c.APIKey != "k" {
+		t.Errorf("c=%+v", c)
+	}
+}
+
+func TestEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_LISTEN", ":7777")
+	t.Setenv("WB2A_API_KEY", "envkey")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen != ":7777" || c.APIKey != "envkey" {
+		t.Errorf("c=%+v", c)
+	}
+}
+
+func TestBadDuration(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"soft_rate":"not-a-duration"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for bad duration")
+	}
+}
+
+func TestHardCreditKeyIgnored(t *testing.T) {
+	// 退役的 hard_credit 键作为 JSON 未知字段被自然忽略，不报错。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"hard_credit":"not-a-duration","soft_rate":"30s"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("hard_credit must be ignored (not validated): %v", err)
+	}
+	if c.SoftRateDur.Seconds() != 30 {
+		t.Errorf("soft_rate=%v want 30s", c.SoftRateDur)
+	}
+}
+
+func TestNewPoolConfigDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Pool.MaxInFlight != 3 {
+		t.Errorf("max_in_flight=%d want 3", c.Pool.MaxInFlight)
+	}
+	if c.Pool.MaxInFlightGlobal != 2 {
+		t.Errorf("max_in_flight_global=%d want 2 (WAF P1-1 global 档默认)", c.Pool.MaxInFlightGlobal)
+	}
+	if c.Pool.BreakerThreshold != 3 {
+		t.Errorf("breaker_threshold=%d want 3", c.Pool.BreakerThreshold)
+	}
+	if c.BreakerCooldownDur.Minutes() != 30 {
+		t.Errorf("breaker_cooldown=%v want 30m", c.BreakerCooldownDur)
+	}
+	if c.BreakerCooldownMaxD.Hours() != 6 {
+		t.Errorf("breaker_cooldown_max=%v want 6h", c.BreakerCooldownMaxD)
+	}
+	if c.Pool.IdleWeightPerHour != 0.5 || c.Pool.IdleWeightMax != 5.0 {
+		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
+	}
+	if c.SoftRateMaxDur.Hours() != 2 {
+		t.Errorf("soft_rate_max=%v want 2h", c.SoftRateMaxDur)
+	}
+	if !c.SessionSticky.Enabled {
+		t.Error("session_sticky.enabled want true")
+	}
+	if c.SessionTTL.Minutes() != 30 || c.SessionGCInterval.Minutes() != 5 {
+		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
+	}
+	if c.Upstash.URL != "" || c.Upstash.Token != "" {
+		t.Errorf("upstash default should be empty: %+v", c.Upstash)
+	}
+}
+
+func TestPoolConfigParsedFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{
+		"upstash":{"url":"https://foo.upstash.io","token":"tok"},
+		"pool":{
+			"max_in_flight":5,
+			"max_in_flight_global":4,
+			"breaker_threshold":4,
+			"breaker_cooldown":"10m",
+			"breaker_cooldown_max":"2h",
+			"idle_weight_per_hour":0.7,
+			"idle_weight_max":8.0
+		},
+		"session_sticky":{"enabled":false,"ttl":"1h","gc_interval":"2m"}
+	}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstash.URL != "https://foo.upstash.io" || c.Upstash.Token != "tok" {
+		t.Errorf("upstash=%+v", c.Upstash)
+	}
+	if c.Pool.MaxInFlight != 5 || c.Pool.BreakerThreshold != 4 {
+		t.Errorf("pool=%+v", c.Pool)
+	}
+	if c.Pool.MaxInFlightGlobal != 4 {
+		t.Errorf("max_in_flight_global=%d want 4 (config 覆盖默认)", c.Pool.MaxInFlightGlobal)
+	}
+	if c.BreakerCooldownDur.Minutes() != 10 || c.BreakerCooldownMaxD.Hours() != 2 {
+		t.Errorf("breaker durations=%v/%v", c.BreakerCooldownDur, c.BreakerCooldownMaxD)
+	}
+	if c.Pool.IdleWeightPerHour != 0.7 || c.Pool.IdleWeightMax != 8.0 {
+		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
+	}
+	if c.SessionSticky.Enabled {
+		t.Error("session_sticky.enabled want false from file")
+	}
+	if c.SessionTTL.Hours() != 1 || c.SessionGCInterval.Minutes() != 2 {
+		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
+	}
+}
+
+func TestSoftRateMaxParsedFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"soft_rate":"5m","soft_rate_max":"45m"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SoftRateDur.Minutes() != 5 {
+		t.Errorf("soft_rate=%v want 5m", c.SoftRateDur)
+	}
+	if c.SoftRateMaxDur.Minutes() != 45 {
+		t.Errorf("soft_rate_max=%v want 45m", c.SoftRateMaxDur)
+	}
+}
+
+func TestSoftRateMaxEmptyFallsBackToDefault(t *testing.T) {
+	// 键缺席 → Default() 的 2h 保留（空串无法 ParseDuration）。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"soft_rate":"90s"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SoftRateMaxDur.Hours() != 2 {
+		t.Errorf("soft_rate_max=%v want 2h fallback", c.SoftRateMaxDur)
+	}
+}
+
+func TestBadSoftRateMax(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"cooldown":{"soft_rate_max":"oops"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for bad soft_rate_max")
+	}
+}
+
+// TestDegradeConfigDefaults 连败降权三键默认值（issue #114）：5 次 / 10m / 封顶 2h。
+// 默认开启但阈值保守（宽于熔断 3）：ErrClient/传输层的判据比 5xx 弱。
+func TestDegradeConfigDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Pool.DegradeThreshold != 5 {
+		t.Errorf("degrade_threshold=%d want 5", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 10 {
+		t.Errorf("degrade_cooldown=%v want 10m", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Hours() != 2 {
+		t.Errorf("degrade_cooldown_max=%v want 2h", c.DegradeCooldownMaxD)
+	}
+}
+
+// TestDegradeConfigParsedFromFile 连败降权三键可从 config.json 覆盖。
+func TestDegradeConfigParsedFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"degrade_threshold":9,"degrade_cooldown":"3m","degrade_cooldown_max":"45m"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool.DegradeThreshold != 9 {
+		t.Errorf("degrade_threshold=%d want 9", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 3 {
+		t.Errorf("degrade_cooldown=%v want 3m", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Minutes() != 45 {
+		t.Errorf("degrade_cooldown_max=%v want 45m", c.DegradeCooldownMaxD)
+	}
+}
+
+// TestDegradeConfigEmptyFallsBackToDefault 时长两键空串回落默认（空串无法
+// ParseDuration，与 soft_rate_max 同口径）；阈值 0/负数回落默认 5。
+func TestDegradeConfigEmptyFallsBackToDefault(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"degrade_threshold":0,"degrade_cooldown":"","degrade_cooldown_max":""}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("空值应回落默认而非报错: %v", err)
+	}
+	if c.Pool.DegradeThreshold != 5 {
+		t.Errorf("degrade_threshold=%d want 5（0 回落默认）", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 10 {
+		t.Errorf("degrade_cooldown=%v want 10m（空串回落默认）", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Hours() != 2 {
+		t.Errorf("degrade_cooldown_max=%v want 2h（空串回落默认）", c.DegradeCooldownMaxD)
+	}
+	// 负数阈值同样回落默认。
+	c2 := Default()
+	c2.Pool.DegradeThreshold = -3
+	if err := c2.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c2.Pool.DegradeThreshold != 5 {
+		t.Errorf("degrade_threshold=-3 normalize 后=%d want 5", c2.Pool.DegradeThreshold)
+	}
+}
+
+// TestBadDegradeCooldown 非法时长 fail fast（拼写错误不静默吞掉，与 breaker 族同风格）。
+func TestBadDegradeCooldown(t *testing.T) {
+	for _, key := range []string{"degrade_cooldown", "degrade_cooldown_max"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"pool":{"`+key+`":"oops"}}`), 0o600)
+		if _, err := Load(fp); err == nil {
+			t.Fatalf("want error for bad %s", key)
+		}
+	}
+}
+
+// TestDegradeEnvOverride env WB2A_DEGRADE_* 非空覆盖 JSON 值（与面板/JSON 同口径）。
+func TestDegradeEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"degrade_threshold":7,"degrade_cooldown":"5m","degrade_cooldown_max":"30m"}}`), 0o600)
+	t.Setenv("WB2A_DEGRADE_THRESHOLD", "11")
+	t.Setenv("WB2A_DEGRADE_COOLDOWN", "2m")
+	t.Setenv("WB2A_DEGRADE_COOLDOWN_MAX", "20m")
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pool.DegradeThreshold != 11 {
+		t.Errorf("degrade_threshold=%d want 11（env 覆盖）", c.Pool.DegradeThreshold)
+	}
+	if c.DegradeCooldownDur.Minutes() != 2 {
+		t.Errorf("degrade_cooldown=%v want 2m（env 覆盖）", c.DegradeCooldownDur)
+	}
+	if c.DegradeCooldownMaxD.Minutes() != 20 {
+		t.Errorf("degrade_cooldown_max=%v want 20m（env 覆盖）", c.DegradeCooldownMaxD)
+	}
+}
+
+// TestDegradeJSONKeyRoundTrip 三键的 JSON tag 名与 config.example.json 一致
+// （面板按同名键读写，tag 改了面板静默不生效）。
+func TestDegradeJSONKeyRoundTrip(t *testing.T) {
+	c := Default()
+	c.Pool.DegradeThreshold = 8
+	c.Pool.DegradeCooldown = "4m"
+	c.Pool.DegradeCooldownMax = "40m"
+	raw, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"degrade_threshold":8`, `"degrade_cooldown":"4m"`, `"degrade_cooldown_max":"40m"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("config JSON 缺键 %s", want)
+		}
+	}
+	// 解析后字段（json:"-"）不得出现在 JSON 里。
+	if strings.Contains(string(raw), "DegradeCooldownDur") {
+		t.Error("解析后字段不应序列化（应为 json:\"-\"）")
+	}
+}
+
+func TestBadBreakerCooldown(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"breaker_cooldown":"oops"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for bad breaker_cooldown")
+	}
+}
+
+func TestUpstreamTimeoutDefaults(t *testing.T) {
+	// 默认：header 回落 timeout，idle 回落 300。
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Upstream.TimeoutSeconds != 120 {
+		t.Errorf("timeout_seconds=%d want 120", c.Upstream.TimeoutSeconds)
+	}
+	if c.Upstream.HeaderTimeoutSeconds != 120 {
+		t.Errorf("header_timeout_seconds=%d want fallback 120", c.Upstream.HeaderTimeoutSeconds)
+	}
+	if c.Upstream.IdleTimeoutSeconds != 300 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
+	}
+}
+
+func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
+	// 只设 timeout_seconds：header 回落同值，idle 回落 300。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.HeaderTimeoutSeconds != 60 {
+		t.Errorf("header_timeout_seconds=%d want fallback 60", c.Upstream.HeaderTimeoutSeconds)
+	}
+	if c.Upstream.IdleTimeoutSeconds != 300 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 300", c.Upstream.IdleTimeoutSeconds)
+	}
+}
+
+func TestUpstreamExplicitHeaderIdle(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":120,"header_timeout_seconds":30,"idle_timeout_seconds":600}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.HeaderTimeoutSeconds != 30 {
+		t.Errorf("header_timeout_seconds=%d want 30", c.Upstream.HeaderTimeoutSeconds)
+	}
+	if c.Upstream.IdleTimeoutSeconds != 600 {
+		t.Errorf("idle_timeout_seconds=%d want 600", c.Upstream.IdleTimeoutSeconds)
+	}
+}
+
+func TestUpstreamEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_HEADER_TIMEOUT_SECONDS", "45")
+	t.Setenv("WB2A_IDLE_TIMEOUT_SECONDS", "900")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.HeaderTimeoutSeconds != 45 {
+		t.Errorf("header_timeout_seconds=%d want env 45", c.Upstream.HeaderTimeoutSeconds)
+	}
+	if c.Upstream.IdleTimeoutSeconds != 900 {
+		t.Errorf("idle_timeout_seconds=%d want env 900", c.Upstream.IdleTimeoutSeconds)
+	}
+}
+
+// TestRetiredTravelIntervalKeyIgnored 退役的 travel_interval_minutes 键按未知字段忽略，不报错。
+func TestRetiredTravelIntervalKeyIgnored(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"travel_interval_minutes":15,"checkin_hours":[9]}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("retired key should not fail load: %v", err)
+	}
+	if len(c.Schedule.CheckinHours) != 1 || c.Schedule.CheckinHours[0] != 9 {
+		t.Errorf("checkin_hours=%v want [9]（同段其余键照常生效）", c.Schedule.CheckinHours)
+	}
+}
+
+// TestScheduleEnabledByDefault 四个任务的 enabled 开关默认均为 true：
+// 老 config 不写这些键，行为必须与从前完全一致。
+func TestScheduleEnabledByDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
+		t.Errorf("enabled defaults want true/true, got %v/%v",
+			c.Schedule.CheckinEnabled, c.Schedule.KeepaliveEnabled)
+	}
+	if !c.Schedule.TravelEnabled || !c.Schedule.ActivityEnabled {
+		t.Errorf("travel/activity enabled defaults want true/true, got %v/%v",
+			c.Schedule.TravelEnabled, c.Schedule.ActivityEnabled)
+	}
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
+		t.Errorf("travel_hours=%v want [9,21]", c.Schedule.TravelHours)
+	}
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
+		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
+	}
+}
+
+// TestScheduleLegacyConfigKeepsRunning 老 config（只写签到/保活小时数组，无新键）加载后仍是启用态，
+// 新开关缺省 true、新 hours 回落默认——对老配置零影响。
+func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"checkin_hours":[9,21],"keepalive_hours":[22]}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
+		t.Errorf("legacy config must stay enabled: %+v", c.Schedule)
+	}
+	if !c.Schedule.TravelEnabled || !c.Schedule.ActivityEnabled {
+		t.Errorf("new switches must default true on legacy config: %+v", c.Schedule)
+	}
+	if len(c.Schedule.CheckinHours) != 2 {
+		t.Errorf("checkin_hours=%v", c.Schedule.CheckinHours)
+	}
+	// 新 hours 缺省 → 回落默认（非空）。
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
+		t.Errorf("travel_hours=%v want default [9,21]", c.Schedule.TravelHours)
+	}
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
+		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+	}
+}
+
+// TestScheduleExplicitDisable 显式 checkin_enabled=false 即可真正关掉签到
+// （issue #27 边界：此前无论怎么配小时都关不掉）。
+func TestScheduleExplicitDisable(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"checkin_enabled":false,"keepalive_enabled":false}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.CheckinEnabled || c.Schedule.KeepaliveEnabled {
+		t.Errorf("want both disabled: %+v", c.Schedule)
+	}
+	// 小时数组仍回落默认值（禁用与默认值互不干扰：重新启用无需补配小时）。
+	if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 9 || c.Schedule.CheckinHours[1] != 21 {
+		t.Errorf("checkin_hours=%v want default [9 21] even when disabled", c.Schedule.CheckinHours)
+	}
+	if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22 {
+		t.Errorf("keepalive_hours=%v want default [22] even when disabled", c.Schedule.KeepaliveHours)
+	}
+}
+
+// TestScheduleTravelActivityExplicitDisable 显式关闭旅行/活跃上报开关。
+func TestScheduleTravelActivityExplicitDisable(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"travel_enabled":false,"activity_enabled":false}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.TravelEnabled || c.Schedule.ActivityEnabled {
+		t.Errorf("want travel/activity disabled: %+v", c.Schedule)
+	}
+	// 签到/保活开关缺省 true（互不干扰）。
+	if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
+		t.Errorf("checkin/keepalive should stay enabled: %+v", c.Schedule)
+	}
+	// hours 仍回落默认。
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
+		t.Errorf("travel_hours=%v want default [9,21] even when disabled", c.Schedule.TravelHours)
+	}
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
+		t.Errorf("activity_hours=%v want default [10] even when disabled", c.Schedule.ActivityHours)
+	}
+}
+
+// TestScheduleTravelActivityInvalidHoursRejected 旅行/活跃非法小时报错并指向正确开关。
+func TestScheduleTravelActivityInvalidHoursRejected(t *testing.T) {
+	cases := []struct{ body, wantSwitch string }{
+		{`{"schedule":{"travel_hours":[25]}}`, "travel_enabled"},
+		{`{"schedule":{"travel_hours":[-1]}}`, "travel_enabled"},
+		{`{"schedule":{"activity_hours":[24]}}`, "activity_enabled"},
+		{`{"schedule":{"activity_hours":[-1]}}`, "activity_enabled"},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(tc.body), 0o600)
+		_, err := Load(fp)
+		if err == nil {
+			t.Fatalf("want error for %s", tc.body)
+		}
+		if !strings.Contains(err.Error(), tc.wantSwitch) {
+			t.Errorf("error for %s should point at schedule.%s: %v", tc.body, tc.wantSwitch, err)
+		}
+	}
+}
+
+// TestScheduleTravelActivityExplicitHours 显式配置旅行/活跃小时。
+func TestScheduleTravelActivityExplicitHours(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"travel_hours":[9,21],"activity_hours":[11]}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
+		t.Errorf("travel_hours=%v want [9 21]", c.Schedule.TravelHours)
+	}
+	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 11 {
+		t.Errorf("activity_hours=%v want [11]", c.Schedule.ActivityHours)
+	}
+}
+
+// TestScheduleDisableKeepsExplicitHours 禁用不擦除用户配置的小时（便于原样恢复）。
+func TestScheduleDisableKeepsExplicitHours(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"checkin_enabled":false,"checkin_hours":[10,14]}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.CheckinEnabled {
+		t.Error("checkin should be disabled")
+	}
+	if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 10 || c.Schedule.CheckinHours[1] != 14 {
+		t.Errorf("explicit hours must be preserved: %v", c.Schedule.CheckinHours)
+	}
+}
+
+// TestScheduleEmptyHoursFallsBackToDefault 空数组 / null / 缺省都视同「未配置」→ 回落默认。
+func TestScheduleEmptyHoursFallsBackToDefault(t *testing.T) {
+	cases := map[string]string{
+		"absent":   `{}`,
+		"empty":    `{"schedule":{}}`,
+		"null":     `{"schedule":{"checkin_hours":null,"keepalive_hours":null,"travel_hours":null,"activity_hours":null}}`,
+		"emptyarr": `{"schedule":{"checkin_hours":[],"keepalive_hours":[],"travel_hours":[],"activity_hours":[]}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			fp := filepath.Join(dir, "c.json")
+			os.WriteFile(fp, []byte(body), 0o600)
+			c, err := Load(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 9 || c.Schedule.CheckinHours[1] != 21 {
+				t.Errorf("checkin_hours=%v want default [9 21]", c.Schedule.CheckinHours)
+			}
+			if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22 {
+				t.Errorf("keepalive_hours=%v want default [22]", c.Schedule.KeepaliveHours)
+			}
+			if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
+				t.Errorf("travel_hours=%v want default [9 21]", c.Schedule.TravelHours)
+			}
+			if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
+				t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
+			}
+			if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
+				t.Errorf("empty hours must not imply disabled: %+v", c.Schedule)
+			}
+			if !c.Schedule.TravelEnabled || !c.Schedule.ActivityEnabled {
+				t.Errorf("empty hours must not imply disabled: %+v", c.Schedule)
+			}
+		})
+	}
+}
+
+// TestScheduleInvalidHourRejected 非法小时快速失败：指向正确的禁用开关，避免用户
+// 猜测哨兵值（[-1] 之类）被静默当成"改到别的整点"。
+func TestScheduleInvalidHourRejected(t *testing.T) {
+	cases := []struct{ body, wantSwitch string }{
+		{`{"schedule":{"checkin_hours":[25]}}`, "checkin_enabled"},
+		{`{"schedule":{"checkin_hours":[-1]}}`, "checkin_enabled"},
+		{`{"schedule":{"keepalive_hours":[-1]}}`, "keepalive_enabled"},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(tc.body), 0o600)
+		_, err := Load(fp)
+		if err == nil {
+			t.Fatalf("want error for %s", tc.body)
+		}
+		if !strings.Contains(err.Error(), tc.wantSwitch) {
+			t.Errorf("error for %s should point at schedule.%s: %v", tc.body, tc.wantSwitch, err)
+		}
+	}
+}
+
+func TestBadSessionTTL(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"session_sticky":{"ttl":"oops"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for bad session_sticky.ttl")
+	}
+}
+
+func TestWriteDefault(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "sub", "config.json") // 顺带验证父目录自动创建
+	key, err := WriteDefault(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// key 形如 sk-<24字符随机串>，两次生成不重复
+	if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
+		t.Errorf("key=%q want sk-<random>", key)
+	}
+	if key2, _ := WriteDefault(filepath.Join(dir, "another.json")); key2 == key {
+		t.Errorf("two generated keys identical: %q", key)
+	}
+	// 落盘文件可被 Load 正常加载，推荐值齐备且 api_key 生效
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load generated config: %v", err)
+	}
+	if c.APIKey != key {
+		t.Errorf("api_key=%q want %q", c.APIKey, key)
+	}
+	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
+		t.Errorf("generated defaults off: %+v", c)
+	}
+	if len(c.Schedule.CheckinHours) == 0 || !c.Schedule.CheckinEnabled {
+		t.Errorf("generated schedule off: %+v", c.Schedule)
+	}
+	// 已存在的文件不覆盖：二次写入同一路径必须报错
+	if _, err := WriteDefault(fp); err == nil {
+		t.Error("WriteDefault must refuse to overwrite existing file")
+	}
+}
+
+func TestBalanceRefreshDefaults(t *testing.T) {
+	// 缺省：启用 + 30 分钟
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.BalanceRefreshEnabled || c.BalanceRefreshInterval != 5*time.Minute {
+		t.Errorf("default balance refresh: enabled=%v interval=%v", c.Schedule.BalanceRefreshEnabled, c.BalanceRefreshInterval)
+	}
+	// 显式配置 10 分钟
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_minutes":10}}`), 0o600)
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.BalanceRefreshInterval != 10*time.Minute {
+		t.Errorf("interval=%v want 10m", c2.BalanceRefreshInterval)
+	}
+	// 显式关闭：interval 归零（不启动）
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_enabled":false}}`), 0o600)
+	c3, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.BalanceRefreshInterval != 0 {
+		t.Errorf("disabled interval=%v want 0", c3.BalanceRefreshInterval)
+	}
+	// 启用但 minutes<=0 → 回落默认 30
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_minutes":-5}}`), 0o600)
+	c4, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c4.BalanceRefreshInterval != 5*time.Minute {
+		t.Errorf("fallback interval=%v want 30m", c4.BalanceRefreshInterval)
+	}
+}
+
+// TestMaxBodyDefault 默认 max_body_mb=0 = **不预拦截**（吸收上游 73fe1f8）。
+//
+// 历史沿革：8（初始）→ 32（v1.9.17，多图会话 8MB 常态误伤）→ 0（本次，对齐上游
+// 「大请求交上游自然响应」）。本项从"默认护栏"变成"默认不设护栏、显式 >0 才开"，
+// 因为上游的错误响应信息量更大（能看到上游到底是什么策略），网关提前 413 反而
+// 挡住上游真实行为。
+func TestMaxBodyDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Server.MaxBodyMB != 0 {
+		t.Errorf("max_body_mb=%d want 0（默认不预拦截）", c.Server.MaxBodyMB)
+	}
+	// 与 handler 侧同源（Default() 取自 server.DefaultMaxBodyBytes）：两处各写一个
+	// 数字时，"配置默认 0、handler 兜底 32MB"这类漂移不会有任何测试报错，只会在
+	// 裸构造 handler 的路径上表现为"配置说不拦，实际按 32MB 拦截"——与
+	// TestReadTimeoutDefault 盯 read_timeout 漂移同一形态。
+	if want := int(server.DefaultMaxBodyBytes >> 20); c.Server.MaxBodyMB != want {
+		t.Errorf("config 默认 %d 与 handler.DefaultMaxBodyBytes(%dMB) 漂移",
+			c.Server.MaxBodyMB, want)
+	}
+	if server.DefaultMaxBodyBytes != 0 {
+		t.Errorf("DefaultMaxBodyBytes=%d want 0（不预拦截）", server.DefaultMaxBodyBytes)
+	}
+}
+
+// TestMaxBodyExplicit 显式设置 max_body_mb 覆盖默认（含显式 0——显式写 0 也是
+// "不预拦截"，与默认同义；含显式 8/32——老用户配的护栏值仍原样生效，不受默认变更影响）。
+func TestMaxBodyExplicit(t *testing.T) {
+	for _, tc := range []struct {
+		json string
+		want int
+	}{
+		{`{"server":{"max_body_mb":0}}`, 0}, // 显式 0 = 不预拦截（与默认同义）
+		{`{"server":{"max_body_mb":8}}`, 8}, // 反向断言：显式 8 仍生效（可覆盖）
+		{`{"server":{"max_body_mb":16}}`, 16},
+		{`{"server":{"max_body_mb":32}}`, 32},
+		{`{"server":{"max_body_mb":128}}`, 128},
+	} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(tc.json), 0o600)
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.Server.MaxBodyMB != tc.want {
+			t.Errorf("%s → max_body_mb=%d want %d", tc.json, c.Server.MaxBodyMB, tc.want)
+		}
+	}
+}
+
+// TestMaxBodyInvalid 非法值（负数）normalize 报错；0 **不再**非法（语义变为"不预拦截"）。
+// 负的字节上限没有合理语义，静默当成极小上限会把所有请求打成 413（最坏的反向风险），
+// 回落默认又会让"我配了个负数"无声无息变成"没护栏"——故 fail fast。
+func TestMaxBodyInvalid(t *testing.T) {
+	for _, v := range []string{"-1", "-100"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)
+		_, err := Load(fp)
+		if err == nil {
+			t.Fatalf("want error for max_body_mb=%s", v)
+		}
+		if !strings.Contains(err.Error(), "server.max_body_mb") {
+			t.Errorf("error should name config key server.max_body_mb: %v", err)
+		}
+	}
+}
+
+// TestConfigExampleMaxBodyMatchesDefault config.example.json 的 max_body_mb 必须与
+// Default() 一致：示例是用户复制起步的模板，值不同步会让"最全样例"反过来误导
+// （用户以为默认是示例里的数）。风格同 TestMachineIDHeadersInExampleConfig。
+func TestConfigExampleMaxBodyMatchesDefault(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Server map[string]any `json:"server"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("config.example.json 非法 JSON: %v", err)
+	}
+	v, ok := doc.Server["max_body_mb"]
+	if !ok {
+		t.Fatal("config.example.json server 段缺 max_body_mb 键")
+	}
+	want := float64(Default().Server.MaxBodyMB)
+	if got, isNum := v.(float64); !isNum || got != want {
+		t.Errorf("config.example.json 的 max_body_mb = %v，want %v（与 Default() 一致）", v, want)
+	}
+}
+
+// TestMaxRotateDefault 默认 max_rotate=3（与 handler 侧 NewHandler 兜底口径一致，
+// 零行为变更：暴露前的写死值就是 3）。
+func TestMaxRotateDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Server.MaxRotate != 3 {
+		t.Errorf("max_rotate=%d want 3", c.Server.MaxRotate)
+	}
+}
+
+// TestMaxRotateExplicit 文件覆盖 max_rotate（池内账号多时调大）。
+func TestMaxRotateExplicit(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{"max_rotate":8}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxRotate != 8 {
+		t.Errorf("max_rotate=%d want 8", c.Server.MaxRotate)
+	}
+}
+
+// TestMaxRotateInvalidFallsBack 非法值（0/负数）回落默认 3 而非报错——与
+// max_body_mb 的 fail fast 相反，走 pool.max_in_flight_global 的「非正回落」先例：
+// max_rotate 的 0 没有"不限"之类的合理语义，无从误导用户，报错只会让手写配置起不来。
+func TestMaxRotateInvalidFallsBack(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"server":{"max_rotate":`+v+`}}`), 0o600)
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("max_rotate=%s must fall back, not error: %v", v, err)
+		}
+		if c.Server.MaxRotate != 3 {
+			t.Errorf("max_rotate=%s normalize 后=%d want 3（回落默认）", v, c.Server.MaxRotate)
+		}
+	}
+	// 键缺席同样保持默认 3（零行为变更的回归锁定）。
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxRotate != 3 {
+		t.Errorf("max_rotate 键缺席=%d want 3", c.Server.MaxRotate)
+	}
+}
+
+// TestMaxRotateJSONKeyRoundTrip JSON 键名双向核对：面板 GET 回显（结构体序列化）
+// 与 POST 保存（反序列化）必须用同一个键名——两边漂移时表单值读不到也存不进。
+// 键名字面量用 hex 构造（显示的字符串未必等于真实字节，字面量断言可能假绿）。
+func TestMaxRotateJSONKeyRoundTrip(t *testing.T) {
+	key := string([]byte{0x6d, 0x61, 0x78, 0x5f, 0x72, 0x6f, 0x74, 0x61, 0x74, 0x65}) // max_rotate
+	if key != "max_rotate" {
+		t.Fatalf("hex decode mismatch: %q", key)
+	}
+	// 入站：用 hex 键走「面板保存」的解析路径。
+	c, err := ParseConfig([]byte(`{"server":{"` + key + `":7}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxRotate != 7 {
+		t.Errorf("hex-key max_rotate=%d want 7", c.Server.MaxRotate)
+	}
+	// 出站：序列化出来的键名必须逐字节等于 max_rotate（面板回显依赖它）。
+	out, err := json.Marshal(c.Server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m[key]; !ok {
+		t.Errorf("server 序列化缺 key %q: %s", key, out)
+	}
+}
+
+// TestMaxInFlightGlobalNormalize max_in_flight_global 的 normalize 语义：
+// 0/负数视为「未设置」回落默认 2（WAF 403 修复 P1-1）。与 max_in_flight 的
+// 0=不限不同——分档键的 0 没有合理语义，回退分档默认最稳。
+func TestMaxInFlightGlobalNormalize(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		c := Default()
+		c.Pool.MaxInFlightGlobal = 0
+		if v == "-1" {
+			c.Pool.MaxInFlightGlobal = -1
+		}
+		if err := c.normalize(); err != nil {
+			t.Fatalf("normalize(%s): %v", v, err)
+		}
+		if c.Pool.MaxInFlightGlobal != 2 {
+			t.Errorf("max_in_flight_global=%s normalize 后=%d want 2（回落默认）", v, c.Pool.MaxInFlightGlobal)
+		}
+	}
+	// 显式正值保持不动（分档可调）。
+	c := Default()
+	c.Pool.MaxInFlightGlobal = 5
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Pool.MaxInFlightGlobal != 5 {
+		t.Errorf("max_in_flight_global=5 normalize 后=%d want 5", c.Pool.MaxInFlightGlobal)
+	}
+}
+
+// TestMaxBodyEnvOverride env WB2A_MAX_BODY_MB 非空覆盖 JSON 值。
+func TestMaxBodyEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":4}}`), 0o600)
+	t.Setenv("WB2A_MAX_BODY_MB", "12")
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.MaxBodyMB != 12 {
+		t.Errorf("max_body_mb=%d want env 12", c.Server.MaxBodyMB)
+	}
+}
+
+// TestPromptDefaultPassthrough 默认 prompt.mode=passthrough（对齐上游：透传客户端
+// 原始 system 是更保守的缺省）；custom 由用户显式选择，此时 PromptText 为内置默认（非空）。
+func TestPromptDefaultPassthrough(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
+	}
+	// passthrough 不加载提示词文本（透传客户端 system）；切 custom 时 normalize 会加载。
+}
+
+// TestPromptExplicitPassthrough passthrough 模式不加载文本（透传客户端原始 system）。
+func TestPromptExplicitPassthrough(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"passthrough"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("mode=%q want passthrough", c.Prompt.Mode)
+	}
+	if c.PromptText != "" {
+		t.Errorf("passthrough should not load PromptText, got len=%d", len(c.PromptText))
+	}
+}
+
+// TestPromptInvalidMode 非法 mode 启动报错。
+func TestPromptInvalidMode(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"bogus"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for invalid prompt.mode")
+	}
+}
+
+// TestPromptFileMissing 文件路径非空但不存在 → 启动报错（fail fast）。
+func TestPromptFileMissing(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"prompt":{"mode":"custom","file":"/nonexistent/p.md"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for missing prompt file")
+	}
+}
+
+// TestPromptFileOverride 自定义 file 覆盖内置默认。
+func TestPromptFileOverride(t *testing.T) {
+	dir := t.TempDir()
+	pf := filepath.Join(dir, "my.md")
+	want := "我的自定义人格入口"
+	os.WriteFile(pf, []byte(want), 0o600)
+	cf := filepath.Join(dir, "c.json")
+	// 用 json.Marshal 拼路径：Windows 反斜杠必须转义，手工字符串拼接会产出非法 JSON。
+	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": pf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cf, cfgJSON, 0o600)
+	c, err := Load(cf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.PromptText != want {
+		t.Errorf("PromptText=%q want %q", c.PromptText, want)
+	}
+}
+
+// TestPromptEnvOverride env 覆盖 prompt.mode 与 prompt.file。
+func TestPromptEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_PROMPT_MODE", "passthrough")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("mode=%q want passthrough", c.Prompt.Mode)
+	}
+}
+
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 缺省 passthrough。
+func TestPromptLegacyConfigNoImpact(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"listen":":9999","api_key":"k"}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Prompt.Mode != "passthrough" {
+		t.Errorf("legacy config should default to passthrough, got %q", c.Prompt.Mode)
+	}
+	if c.Listen != ":9999" {
+		t.Errorf("listen=%q", c.Listen)
+	}
+}
+
+// TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
+// 缺省空串保持现状（headers 层回落到 clientUA）。
+func TestUpstreamUserAgentConfig(t *testing.T) {
+	// JSON 配置
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"user_agent":"WorkBuddy/1.2.3"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.UserAgent != "WorkBuddy/1.2.3" {
+		t.Errorf("user_agent=%q want WorkBuddy/1.2.3", c.Upstream.UserAgent)
+	}
+	// 缺省为空
+	if c2, err := Load(""); err != nil || c2.Upstream.UserAgent != "" {
+		t.Errorf("default user_agent=%q want empty (err=%v)", c2.Upstream.UserAgent, err)
+	}
+	// env 覆盖
+	t.Setenv("WB2A_USER_AGENT", "EnvAgent/9")
+	c3, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.Upstream.UserAgent != "EnvAgent/9" {
+		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
+	}
+}
+
+// TestLoadConfigPathIsDirectory config 路径是目录时给出可操作提示（Docker bind mount 陷阱）。
+// 复现：compose 挂载 ./config.json 但宿主机缺该文件 → Docker 创建同名目录 → 启动失败。
+// 旧行为只报 "read config: ... Incorrect function" 之类晦涩错误，无从排查。
+func TestLoadConfigPathIsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	asDir := filepath.Join(dir, "config.json")
+	if err := os.Mkdir(asDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(asDir)
+	if err == nil {
+		t.Fatal("want error when config path is a directory")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "是目录") {
+		t.Errorf("error should explain it is a directory: %v", err)
+	}
+	if !strings.Contains(msg, "config.example.json") {
+		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
+	}
+}
+
+// TestZeroWidthSanitizeDefaultOffAndEnvOverride 零宽脱敏的默认值与开关路径。
+//
+// 默认必须是关：这个功能改动的是"看不见的字节"，出问题时表现为两个看起来一样的
+// 字符串对不上，排查成本高，所以由使用者显式开启（与上游 codebuddy2api 口径一致）。
+func TestZeroWidthSanitizeDefaultOffAndEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	key, err := WriteDefault(path)
+	if err != nil {
+		t.Fatalf("WriteDefault: %v", err)
+	}
+	if key == "" {
+		t.Error("应生成随机 api_key")
+	}
+	// 生成的配置文件必须显式含该键且为 false —— 让用户能看见并直接改。
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gen struct {
+		Features map[string]any `json:"features"`
+	}
+	if err := json.Unmarshal(raw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := gen.Features["zerowidth_sanitize"]
+	if !ok {
+		t.Errorf("生成的配置缺少 features.zerowidth_sanitize 键：%v", gen.Features)
+	} else if v != false {
+		t.Errorf("zerowidth_sanitize 默认应为 false，实际 %v", v)
+	}
+
+	// 不设环境变量 → 关闭。
+	if c, err := Load(path); err != nil {
+		t.Fatal(err)
+	} else if c.Features.ZeroWidthSanitize {
+		t.Error("缺省应为关闭")
+	}
+
+	// 环境变量打开。注意用 ParseBool 口径：只有 true/false/1/0 等合法值生效。
+	t.Setenv("WB2A_ZEROWIDTH_SANITIZE", "true")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Features.ZeroWidthSanitize {
+		t.Error("WB2A_ZEROWIDTH_SANITIZE=true 应打开零宽脱敏")
+	}
+
+	// 与指纹脱敏是两个独立开关：开零宽不得连带改动另一个。
+	if !c.Features.SanitizeBlacklistFingerprints {
+		t.Error("零宽开关不应影响 sanitize_blacklist_fingerprints（默认仍应为 true）")
+	}
+}
+
+// TestRestartRequiredFieldsSessionTTLHotApplied 面板「需重启」清单的边界：
+// session_sticky.ttl 已改为热生效（Router.SetTTL）→ 不得再出现在清单里，
+// 否则面板会提示用户"改了要重启"，而实际已即时生效（误导性提示）。
+// gc_interval 反向：GC ticker 不热重建 → 必须仍在清单里。
+func TestRestartRequiredFieldsSessionTTLHotApplied(t *testing.T) {
+	got := restartRequiredFields(Default())
+	var hasTTL, hasGC bool
+	for _, f := range got {
+		switch f {
+		case "session_sticky.ttl":
+			hasTTL = true
+		case "session_sticky.gc_interval":
+			hasGC = true
+		}
+	}
+	if hasTTL {
+		t.Errorf("session_sticky.ttl 已热生效，不应在需重启清单里: %v", got)
+	}
+	if !hasGC {
+		t.Errorf("session_sticky.gc_interval 仍应需重启，清单里缺失: %v", got)
+	}
+}
+
+// TestMachineIDHeadersDefaultOnAndEnvOverride 账号级设备指纹头的配置语义：
+// 缺省 true（键缺席零影响，与上游三仓默认一致），显式 false 才关，
+// WB2A_MACHINE_ID_HEADERS 可覆盖。config.example.json 必须含该键（面板/文档同一来源）。
+func TestMachineIDHeadersDefaultOnAndEnvOverride(t *testing.T) {
+	if !Default().Upstream.MachineIDHeaders {
+		t.Error("Default() 的 upstream.machine_id_headers 必须缺省 true")
+	}
+	// 键缺席（老配置）→ 保持 true：Load 先取 Default 再 Unmarshal 覆盖。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"listen":":9999"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.MachineIDHeaders {
+		t.Error("配置文件缺 machine_id_headers 键时应保持缺省 true（老配置零影响）")
+	}
+	// 显式 false → 关。
+	if err := os.WriteFile(fp, []byte(`{"upstream":{"machine_id_headers":false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.MachineIDHeaders {
+		t.Error("显式 machine_id_headers=false 应关闭")
+	}
+	// env 覆盖。
+	t.Setenv("WB2A_MACHINE_ID_HEADERS", "false")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.MachineIDHeaders {
+		t.Error("WB2A_MACHINE_ID_HEADERS=false 应关闭")
+	}
+	t.Setenv("WB2A_MACHINE_ID_HEADERS", "true")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.MachineIDHeaders {
+		t.Error("WB2A_MACHINE_ID_HEADERS=true 应打开（覆盖文件里的 false）")
+	}
+}
+
+// TestMachineIDHeadersInExampleConfig config.example.json 是配置项最完整参考
+// （README 明示）——新增键必须同步落进去，否则跟随示例的用户拿着"最全样例"却看不到该开关。
+func TestMachineIDHeadersInExampleConfig(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Upstream map[string]any `json:"upstream"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("config.example.json 非法 JSON: %v", err)
+	}
+	v, ok := doc.Upstream["machine_id_headers"]
+	if !ok {
+		t.Fatal("config.example.json upstream 段缺 machine_id_headers 键")
+	}
+	if b, isBool := v.(bool); !isBool || !b {
+		t.Errorf("config.example.json 的 machine_id_headers = %v，want true（与 Default() 一致）", v)
+	}
+	// 示例文件必须能被本进程解析（新键不引入校验失败）。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(fp, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(fp); err != nil {
+		t.Errorf("config.example.json 应能被 Load 解析: %v", err)
+	}
+}
+
+// TestUpstreamConnLayerDefaults 连接层四项缺省：h2 **启用**（DisableHTTP2 零值
+// false）+ 30/30/90。h2 默认启用是本任务的核心约定（CN 上游走 TUN 代理实测：
+// 允许 h2 复用 90%，禁 h2 复用率 0%）——这条锁住默认值不被回退成 HTTP/1.1。
+func TestUpstreamConnLayerDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Upstream.DisableHTTP2 {
+		t.Error("disable_http2 缺省必须为 false（= 启用 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 30 {
+		t.Errorf("tls_handshake_timeout_seconds=%d want 30", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+	if c.Upstream.DialTimeoutSeconds != 30 {
+		t.Errorf("dial_timeout_seconds=%d want 30", c.Upstream.DialTimeoutSeconds)
+	}
+	if c.Upstream.IdleConnTimeoutSeconds != 90 {
+		t.Errorf("idle_conn_timeout_seconds=%d want 90（30s 太激进，v1.9.6 的 90s 实测顺滑）", c.Upstream.IdleConnTimeoutSeconds)
+	}
+}
+
+// TestUpstreamConnLayerJSONRoundTrip JSON 键名往返：四个键按任务书约定的
+// snake_case 落盘，且 Default() 序列化后含这四个键（面板/样例文件同口径）。
+
+// TestUpstreamConnLayerJSONRoundTrip JSON 键名往返：四个键按任务书约定的
+// snake_case 落盘，且 Default() 序列化后含这四个键（面板/样例文件同口径）。
+func TestUpstreamConnLayerJSONRoundTrip(t *testing.T) {
+	raw, err := json.Marshal(Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		`"disable_http2"`, `"tls_handshake_timeout_seconds"`,
+		`"dial_timeout_seconds"`, `"idle_conn_timeout_seconds"`,
+	} {
+		if !strings.Contains(string(raw), key) {
+			t.Errorf("Default() 序列化缺 JSON 键 %s", key)
+		}
+	}
+}
+
+// TestUpstreamConnLayerFileOverride 文件覆盖：四个键各自独立生效（含 h2 显式关闭）。
+
+// TestUpstreamConnLayerFileOverride 文件覆盖：四个键各自独立生效（含 h2 显式关闭）。
+func TestUpstreamConnLayerFileOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"disable_http2":true,"tls_handshake_timeout_seconds":15,`+
+		`"dial_timeout_seconds":7,"idle_conn_timeout_seconds":45}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.DisableHTTP2 {
+		t.Error("disable_http2=true 应生效（显式关闭 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 15 {
+		t.Errorf("tls_handshake_timeout_seconds=%d want 15", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+	if c.Upstream.DialTimeoutSeconds != 7 {
+		t.Errorf("dial_timeout_seconds=%d want 7", c.Upstream.DialTimeoutSeconds)
+	}
+	if c.Upstream.IdleConnTimeoutSeconds != 45 {
+		t.Errorf("idle_conn_timeout_seconds=%d want 45", c.Upstream.IdleConnTimeoutSeconds)
+	}
+}
+
+// TestUpstreamConnLayerInvalidFallsBack 非法值回落：三个超时 0 / 负数一律回落
+// 推荐值（30/30/90），不报错——与 max_rotate / max_in_flight_global 同风格，
+// 「0 没有合理语义」时回落默认而非让部署起不来。显式 0 的 disable_http2 无回落
+// 语义（bool false 就是「启用 h2」）。
+
+// TestUpstreamConnLayerInvalidFallsBack 非法值回落：三个超时 0 / 负数一律回落
+// 推荐值（30/30/90），不报错——与 max_rotate / max_in_flight_global 同风格，
+// 「0 没有合理语义」时回落默认而非让部署起不来。显式 0 的 disable_http2 无回落
+// 语义（bool false 就是「启用 h2」）。
+func TestUpstreamConnLayerInvalidFallsBack(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"upstream":{"disable_http2":false,"tls_handshake_timeout_seconds":0,`+
+		`"dial_timeout_seconds":-5,"idle_conn_timeout_seconds":-1}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("非法值应回落而非报错: %v", err)
+	}
+	if c.Upstream.DisableHTTP2 {
+		t.Error("disable_http2=false 应保持 false（启用 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 30 {
+		t.Errorf("tls_handshake_timeout_seconds=%d want 回落 30", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+	if c.Upstream.DialTimeoutSeconds != 30 {
+		t.Errorf("dial_timeout_seconds=%d want 回落 30", c.Upstream.DialTimeoutSeconds)
+	}
+	if c.Upstream.IdleConnTimeoutSeconds != 90 {
+		t.Errorf("idle_conn_timeout_seconds=%d want 回落 90", c.Upstream.IdleConnTimeoutSeconds)
+	}
+}
+
+// TestUpstreamConnLayerEnvOverride env 覆盖（与 JSON/面板同口径）。
+
+// TestUpstreamConnLayerEnvOverride env 覆盖（与 JSON/面板同口径）。
+func TestUpstreamConnLayerEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_DISABLE_HTTP2", "true")
+	t.Setenv("WB2A_TLS_HANDSHAKE_TIMEOUT_SECONDS", "25")
+	t.Setenv("WB2A_DIAL_TIMEOUT_SECONDS", "26")
+	t.Setenv("WB2A_IDLE_CONN_TIMEOUT_SECONDS", "27")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Upstream.DisableHTTP2 {
+		t.Error("WB2A_DISABLE_HTTP2=true 应生效")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 25 || c.Upstream.DialTimeoutSeconds != 26 || c.Upstream.IdleConnTimeoutSeconds != 27 {
+		t.Errorf("env 覆盖失败: %+v", c.Upstream)
+	}
+}
+
+// TestUpstreamConnLayerEnvInvalidIgnored env 非法值忽略（保持文件/默认值），
+// 与既有 WB2A_PASSTHROUGH_IP 的 ParseBool 口径一致。
+
+// TestUpstreamConnLayerEnvInvalidIgnored env 非法值忽略（保持文件/默认值），
+// 与既有 WB2A_PASSTHROUGH_IP 的 ParseBool 口径一致。
+func TestUpstreamConnLayerEnvInvalidIgnored(t *testing.T) {
+	t.Setenv("WB2A_DISABLE_HTTP2", "notabool")
+	t.Setenv("WB2A_TLS_HANDSHAKE_TIMEOUT_SECONDS", "abc")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Upstream.DisableHTTP2 {
+		t.Error("非法 bool 应忽略（保持默认 false = 启用 h2）")
+	}
+	if c.Upstream.TLSHandshakeTimeoutSeconds != 30 {
+		t.Errorf("非法 int 应忽略（保持默认 30），got %d", c.Upstream.TLSHandshakeTimeoutSeconds)
+	}
+}
+
+// TestRestartRequiredFieldsConnLayer 连接层四项必须在「需重启」清单里：
+// Transport 是装配期对象（HTTP/ChatHTTP 共享），运行期重建会换掉在途请求脚下的
+// Transport，刻意不做热改。清单缺项 → 面板提示"已立即生效"，而实际要重启才生效。
+
+// TestRestartRequiredFieldsConnLayer 连接层四项必须在「需重启」清单里：
+// Transport 是装配期对象（HTTP/ChatHTTP 共享），运行期重建会换掉在途请求脚下的
+// Transport，刻意不做热改。清单缺项 → 面板提示"已立即生效"，而实际要重启才生效。
+func TestRestartRequiredFieldsConnLayer(t *testing.T) {
+	got := restartRequiredFields(Default())
+	want := []string{
+		"upstream.disable_http2",
+		"upstream.tls_handshake_timeout_seconds",
+		"upstream.dial_timeout_seconds",
+		"upstream.idle_conn_timeout_seconds",
+	}
+	set := map[string]bool{}
+	for _, f := range got {
+		set[f] = true
+	}
+	for _, w := range want {
+		if !set[w] {
+			t.Errorf("需重启清单缺 %s: %v", w, got)
+		}
+	}
+}
+
+// TestAuthWatchDefaults auths 目录热加载的缺省口径：开启 + 30 秒。
+// 缺省必须是「开着」——这个特性的存在意义就是让手工上传的账号文件免重启生效，
+// 默认关闭等于把它退化成「用户得先知道有这个东西并去打开」。
+func TestAuthWatchDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.AuthWatchEnabled {
+		t.Error("auth_watch_enabled 缺省应为 true")
+	}
+	if c.Schedule.AuthWatchSeconds != 30 {
+		t.Errorf("auth_watch_seconds 缺省=%d want 30", c.Schedule.AuthWatchSeconds)
+	}
+	if c.AuthWatchInterval != 30*time.Second {
+		t.Errorf("AuthWatchInterval=%v want 30s", c.AuthWatchInterval)
+	}
+}
+
+// TestAuthWatchNormalize 三种配置形态：显式改间隔 / 显式关闭 / <=0 回落 30。
+// 回落口径与 balance_refresh 一致：0 是「开关关闭」的哨兵值，故 <=0 先回落再判
+// （否则「配了 0 秒」会被当成关闭开关，而不是回落默认）。
+
+// TestAuthWatchNormalize 三种配置形态：显式改间隔 / 显式关闭 / <=0 回落 30。
+// 回落口径与 balance_refresh 一致：0 是「开关关闭」的哨兵值，故 <=0 先回落再判
+// （否则「配了 0 秒」会被当成关闭开关，而不是回落默认）。
+func TestAuthWatchNormalize(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	write := func(body string) *Config {
+		t.Helper()
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", body, err)
+		}
+		return c
+	}
+
+	// 显式间隔 120 秒。
+	c := write(`{"schedule":{"auth_watch_seconds":120}}`)
+	if c.AuthWatchInterval != 2*time.Minute {
+		t.Errorf("interval=%v want 2m", c.AuthWatchInterval)
+	}
+	if !c.Schedule.AuthWatchEnabled {
+		t.Error("只配间隔不应关掉开关")
+	}
+
+	// 显式关闭：interval 归零（main 侧据此不扫描）。
+	c = write(`{"schedule":{"auth_watch_enabled":false}}`)
+	if c.AuthWatchInterval != 0 {
+		t.Errorf("关闭时 interval=%v want 0", c.AuthWatchInterval)
+	}
+
+	// 启用但秒数 <=0 → 回落默认 30。
+	c = write(`{"schedule":{"auth_watch_seconds":-5}}`)
+	if c.Schedule.AuthWatchSeconds != 30 || c.AuthWatchInterval != 30*time.Second {
+		t.Errorf("秒数<=0 应回落 30：sec=%d interval=%v", c.Schedule.AuthWatchSeconds, c.AuthWatchInterval)
+	}
+
+	// 关闭且秒数 <=0：不回落（开关关了就没有生效间隔可言）。
+	c = write(`{"schedule":{"auth_watch_enabled":false,"auth_watch_seconds":-5}}`)
+	if c.AuthWatchInterval != 0 {
+		t.Errorf("关闭时不应回落出间隔: %v", c.AuthWatchInterval)
+	}
+}
+
+// TestAuthWatchNotRestartRequired auth_dir 本身仍是重启项（watcher 在启动时捕获目录），
+// 但 interval/开关必须能热改——面板保存后不应把它列进「需重启」提示。
+
+// TestAuthWatchNotRestartRequired auth_dir 本身仍是重启项（watcher 在启动时捕获目录），
+// 但 interval/开关必须能热改——面板保存后不应把它列进「需重启」提示。
+func TestAuthWatchNotRestartRequired(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "auth_watch") {
+			t.Errorf("auth_watch 可热改，不应出现在重启项清单: %q", f)
+		}
+	}
+	// auth_dir 仍在清单里（目录是装配期捕获的）。
+	found := false
+	for _, f := range restartRequiredFields(c) {
+		if f == "auth_dir" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("auth_dir 应仍是重启项（watcher 启动时捕获目录，运行期不跟随热改）")
+	}
+}
+
+// TestConfigExampleHasAuthWatchKeys config.example.json 必须带上新键：
+// 它是用户复制起步的模板（也是「程序自动生成推荐配置」的形状参考），缺键会让新特性
+// 在用户眼里不存在——面板能改，但手写配置的人不会知道有这项。
+
+// TestConfigExampleHasAuthWatchKeys config.example.json 必须带上新键：
+// 它是用户复制起步的模板（也是「程序自动生成推荐配置」的形状参考），缺键会让新特性
+// 在用户眼里不存在——面板能改，但手写配置的人不会知道有这项。
+func TestConfigExampleHasAuthWatchKeys(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模板必须能被启动路径原样解析（含所有新键）。
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if !c.Schedule.AuthWatchEnabled || c.Schedule.AuthWatchSeconds != 30 {
+		t.Errorf("example 的 auth_watch 口径=%v/%d want true/30",
+			c.Schedule.AuthWatchEnabled, c.Schedule.AuthWatchSeconds)
+	}
+}
+
+// TestReadTimeoutDefault 默认 read_timeout_seconds=300（与 handler 侧
+// DefaultReadTimeout 同口径）。旧版该值是写死的 60s——正是生产 503 事故的根因
+// （460KB 上下文经跨境慢链路上传撞上 60s，用户对话被拦腰截断）。
+func TestReadTimeoutDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("read_timeout_seconds=%d want 300", c.Server.ReadTimeoutSeconds)
+	}
+	// 与 handler 侧兜底同源（Default()/normalize 均取自 server.DefaultReadTimeout）：
+	// 两处各写一个数字时，"配置默认 300、handler 兜底 60"这类漂移不会有任何测试报错，
+	// 只会在生产上表现为"配置明明写着 300，实际按 60 掐断"——正是本次事故的形态。
+	if want := int(server.DefaultReadTimeout / time.Second); c.Server.ReadTimeoutSeconds != want {
+		t.Errorf("config 默认 %d 与 handler.DefaultReadTimeout(%v=%ds) 漂移",
+			c.Server.ReadTimeoutSeconds, server.DefaultReadTimeout, want)
+	}
+}
+
+// TestReadTimeoutExplicit 文件覆盖 read_timeout_seconds（慢链路/大上下文调大）。
+func TestReadTimeoutExplicit(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"server":{"read_timeout_seconds":900}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 900 {
+		t.Errorf("read_timeout_seconds=%d want 900", c.Server.ReadTimeoutSeconds)
+	}
+}
+
+// TestReadTimeoutInvalidFallsBack 非法值（0/负数）回落默认 300 而非报错——与
+// max_rotate 同风格（0 没有"不限"之类的合理语义）。
+//
+// 特别注意这里**刻意不采纳** http.Server 的「0 = 不限」语义：0 在配置文件里更可能
+// 被当成"没填"，而"不限"等于拆掉慢速 body 的闸门，与旧值 60s 的防护意图相悖。
+// 故断言必须是"回落 300"而不是"变成 0"。
+func TestReadTimeoutInvalidFallsBack(t *testing.T) {
+	for _, v := range []string{"0", "-1"} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		if err := os.WriteFile(fp, []byte(`{"server":{"read_timeout_seconds":`+v+`}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("read_timeout_seconds=%s must fall back, not error: %v", v, err)
+		}
+		if c.Server.ReadTimeoutSeconds != 300 {
+			t.Errorf("read_timeout_seconds=%s normalize 后=%d want 300（回落默认，而非 0=不限）",
+				v, c.Server.ReadTimeoutSeconds)
+		}
+	}
+	// 键缺席同样保持默认 300（老配置零影响）。
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("read_timeout_seconds 键缺席=%d want 300", c.Server.ReadTimeoutSeconds)
+	}
+}
+
+// TestReadTimeoutEnvOverride env WB2A_READ_TIMEOUT_SECONDS 覆盖 JSON 值；
+// 非法（<=0）同样走 normalize 回落 300（env 与 JSON 同口径）。
+func TestReadTimeoutEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"server":{"read_timeout_seconds":120}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WB2A_READ_TIMEOUT_SECONDS", "600")
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 600 {
+		t.Errorf("WB2A_READ_TIMEOUT_SECONDS=600 应覆盖 JSON 的 120，got %d", c.Server.ReadTimeoutSeconds)
+	}
+	t.Setenv("WB2A_READ_TIMEOUT_SECONDS", "0")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("WB2A_READ_TIMEOUT_SECONDS=0 应回落 300，got %d", c.Server.ReadTimeoutSeconds)
+	}
+}
+
+// TestReadTimeoutJSONKeyRoundTrip JSON 键名双向核对：面板 GET 回显（结构体序列化）
+// 与 POST 保存（反序列化）必须用同一个键名——两边漂移时表单值读不到也存不进。
+// 键名字面量用 hex 构造（显示的字符串未必等于真实字节，字面量断言可能假绿）。
+func TestReadTimeoutJSONKeyRoundTrip(t *testing.T) {
+	key := string([]byte{
+		0x72, 0x65, 0x61, 0x64, 0x5f, 0x74, 0x69, 0x6d, 0x65, 0x6f, 0x75, 0x74, 0x5f,
+		0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x73,
+	}) // read_timeout_seconds
+	if key != "read_timeout_seconds" {
+		t.Fatalf("hex decode mismatch: %q", key)
+	}
+	// 入站：用 hex 键走「面板保存」的解析路径。
+	c, err := ParseConfig([]byte(`{"server":{"` + key + `":450}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Server.ReadTimeoutSeconds != 450 {
+		t.Errorf("hex-key read_timeout_seconds=%d want 450", c.Server.ReadTimeoutSeconds)
+	}
+	// 出站：序列化出来的键名必须逐字节等于 read_timeout_seconds（面板回显依赖它）。
+	out, err := json.Marshal(c.Server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m[key]; !ok {
+		t.Errorf("server 序列化缺 key %q: %s", key, out)
+	}
+}
+
+// TestReadTimeoutHotAppliedNotRestartRequired read_timeout_seconds 必须能热改，
+// 不得出现在「需重启」清单里。
+//
+// 锁的是设计取舍：本项走 handler.SetReadTimeout（逐请求重设读截止）而非
+// http.Server.ReadTimeout 静态字段，面板保存后立即生效。若被误加进重启清单，面板
+// 会对一个已即时生效的键提示"需重启"（误导性提示，用户明确抱怨过这类问题）。
+func TestReadTimeoutHotAppliedNotRestartRequired(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "read_timeout") {
+			t.Errorf("read_timeout_seconds 已热生效，不应在需重启清单里: %q", f)
+		}
+	}
+	// 反向：max_body_mb 也不该在（同口径热改），确认清单语义没被整体改坏。
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "max_body_mb") {
+			t.Errorf("max_body_mb 已热生效，不应在需重启清单里: %q", f)
+		}
+	}
+}
+
+// TestConfigExampleHasReadTimeoutKey config.example.json 必须带上新键：
+// 它是用户复制起步的模板，缺键会让新特性在手写配置的人眼里不存在。
+func TestConfigExampleHasReadTimeoutKey(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if c.Server.ReadTimeoutSeconds != 300 {
+		t.Errorf("example 的 read_timeout_seconds=%d want 300", c.Server.ReadTimeoutSeconds)
+	}
+}
+
+// TestCooldownProbeDefaults 后台冷却探活缺省开启、10 分钟一轮。
+//
+// 缺省开启的依据（用户痛点）：单账号部署撞 6004 后整站 503，网关没有任何机制去试
+// 上游是否已提前恢复——探活是唯一出路，默认关掉等于把这个痛点留给用户自己发现。
+// 成本可控：无到期目标时整轮零出站流量（只做一次池遍历）。
+func TestCooldownProbeDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.CooldownProbeEnabled {
+		t.Error("cooldown_probe_enabled 缺省应为 true")
+	}
+	if c.Schedule.CooldownProbeMinutes != 10 {
+		t.Errorf("cooldown_probe_minutes 缺省=%d want 10", c.Schedule.CooldownProbeMinutes)
+	}
+	if c.CooldownProbeInterval != 10*time.Minute {
+		t.Errorf("CooldownProbeInterval=%v want 10m", c.CooldownProbeInterval)
+	}
+}
+
+// TestCooldownProbeNormalize 三种配置形态：显式改间隔 / 显式关闭 / <=0 回落 10。
+// 回落口径与 balance_refresh / auth_watch 一致：0 是「开关关闭」的哨兵值，
+// 故 <=0 先回落再判（否则「配了 0 分钟」会被当成关闭开关，而不是回落默认）。
+
+// TestCooldownProbeNormalize 三种配置形态：显式改间隔 / 显式关闭 / <=0 回落 10。
+// 回落口径与 balance_refresh / auth_watch 一致：0 是「开关关闭」的哨兵值，
+// 故 <=0 先回落再判（否则「配了 0 分钟」会被当成关闭开关，而不是回落默认）。
+func TestCooldownProbeNormalize(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	write := func(body string) *Config {
+		t.Helper()
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", body, err)
+		}
+		return c
+	}
+
+	c := write(`{"schedule":{"cooldown_probe_enabled":true,"cooldown_probe_minutes":3}}`)
+	if c.CooldownProbeInterval != 3*time.Minute {
+		t.Errorf("显式 3 分钟: interval=%v want 3m", c.CooldownProbeInterval)
+	}
+
+	c = write(`{"schedule":{"cooldown_probe_enabled":false,"cooldown_probe_minutes":3}}`)
+	if c.CooldownProbeInterval != 0 {
+		t.Errorf("显式关闭: interval=%v want 0（不启动/暂停）", c.CooldownProbeInterval)
+	}
+	if c.Schedule.CooldownProbeEnabled {
+		// 显式 false 应生效——这里若为 true 说明开关被 normalize 覆盖了。
+		t.Error("显式 cooldown_probe_enabled=false 未生效")
+	}
+
+	// <=0 回落默认 10（0 是关闭哨兵，不表意"不限/立即"）。
+	c = write(`{"schedule":{"cooldown_probe_enabled":true,"cooldown_probe_minutes":0}}`)
+	if c.Schedule.CooldownProbeMinutes != 10 || c.CooldownProbeInterval != 10*time.Minute {
+		t.Errorf("minutes=0: %d/%v want 10/10m（回落默认）",
+			c.Schedule.CooldownProbeMinutes, c.CooldownProbeInterval)
+	}
+	c = write(`{"schedule":{"cooldown_probe_enabled":true,"cooldown_probe_minutes":-5}}`)
+	if c.Schedule.CooldownProbeMinutes != 10 || c.CooldownProbeInterval != 10*time.Minute {
+		t.Errorf("minutes=-5: %d/%v want 10/10m（回落默认）",
+			c.Schedule.CooldownProbeMinutes, c.CooldownProbeInterval)
+	}
+}
+
+// TestCooldownProbeNotRestartRequired 探活间隔/开关必须**不**出现在重启项清单里：
+// 它经 SetCooldownProbeInterval 原子热改（面板保存后下一轮即按新值），列为重启项
+// 会让面板给出误导性提示（用户以为要重启，实际已生效）。
+
+// TestCooldownProbeNotRestartRequired 探活间隔/开关必须**不**出现在重启项清单里：
+// 它经 SetCooldownProbeInterval 原子热改（面板保存后下一轮即按新值），列为重启项
+// 会让面板给出误导性提示（用户以为要重启，实际已生效）。
+func TestCooldownProbeNotRestartRequired(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "cooldown_probe") {
+			t.Errorf("restartRequiredFields 含 %q：探活间隔/开关是热改项，不该提示重启", f)
+		}
+	}
+}
+
+// TestConfigExampleHasCooldownProbeKeys config.example.json 必须带上新键
+// （且能被启动路径原样解析）——模板缺键时用户不知道有这个开关存在。
+
+// TestConfigExampleHasCooldownProbeKeys config.example.json 必须带上新键
+// （且能被启动路径原样解析）——模板缺键时用户不知道有这个开关存在。
+func TestConfigExampleHasCooldownProbeKeys(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if !c.Schedule.CooldownProbeEnabled || c.Schedule.CooldownProbeMinutes != 10 {
+		t.Errorf("example 的 cooldown_probe 口径=%v/%d want true/10",
+			c.Schedule.CooldownProbeEnabled, c.Schedule.CooldownProbeMinutes)
+	}
+}
+
+// TestReasoningHistoryConfig features.reasoning_history 三档解析：默认 full（零回归）、
+// 合法值大小写/空白归一、非法值（空串/未知）回落 full 并记 warn（fail-safe，不 fail fast）。
+func TestReasoningHistoryConfig(t *testing.T) {
+	// 默认（Default() 与「JSON 缺键」两条路径都必须落 full）。
+	if c := Default(); c.Features.ReasoningHistory != "full" {
+		t.Errorf("Default() 档位 = %q want full", c.Features.ReasoningHistory)
+	}
+	c, err := ParseConfig([]byte(`{"listen":":7863"}`))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("键缺席时档位 = %q want full", c.Features.ReasoningHistory)
+	}
+
+	// 合法档位：原样 / 大小写与首尾空白归一。
+	for _, tc := range []struct{ in, want string }{
+		{"full", "full"},
+		{"last", "last"},
+		{"blank", "blank"},
+		{" LAST ", "last"},
+		{"Blank", "blank"},
+		{"FULL", "full"},
+	} {
+		c, err := ParseConfig([]byte(`{"features":{"reasoning_history":` + jsonQuoteLiteral(tc.in) + `}}`))
+		if err != nil {
+			t.Fatalf("ParseConfig(%q): %v", tc.in, err)
+		}
+		if c.Features.ReasoningHistory != tc.want {
+			t.Errorf("reasoning_history=%q 归一化后 = %q want %q", tc.in, c.Features.ReasoningHistory, tc.want)
+		}
+	}
+
+	// 非法档位：回落 full 且必须有一条 warn（用户能从日志看出配置没生效）。
+	for _, in := range []string{"", "bogus", "off", "none", "true"} {
+		var buf bytes.Buffer
+		old := log.Writer()
+		log.SetOutput(&buf)
+		c, err := ParseConfig([]byte(`{"features":{"reasoning_history":` + jsonQuoteLiteral(in) + `}}`))
+		log.SetOutput(old)
+		if err != nil {
+			t.Fatalf("非法档位 %q 不该报错（fail-safe）：%v", in, err)
+		}
+		if c.Features.ReasoningHistory != "full" {
+			t.Errorf("非法档位 %q 应回落 full，实际 %q", in, c.Features.ReasoningHistory)
+		}
+		if !strings.Contains(buf.String(), "reasoning_history") {
+			t.Errorf("非法档位 %q 应记一条含 reasoning_history 的 warn，实际日志 %q", in, buf.String())
+		}
+	}
+
+	// env 覆盖与 JSON 同口径（非法值同样回落 full）。
+	t.Setenv("WB2A_REASONING_HISTORY", "blank")
+	c = Default()
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.ReasoningHistory != "blank" {
+		t.Errorf("WB2A_REASONING_HISTORY=blank 后 = %q want blank", c.Features.ReasoningHistory)
+	}
+	t.Setenv("WB2A_REASONING_HISTORY", "nope")
+	c = Default()
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("env 非法值应回落 full，实际 %q", c.Features.ReasoningHistory)
+	}
+}
+
+// TestReasoningHistoryInGeneratedConfig WriteDefault 生成的配置必须显式含该键且为
+// "full"（模板缺键时用户不知道有这个开关存在），且缺省加载即 full。
+func TestReasoningHistoryInGeneratedConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if _, err := WriteDefault(path); err != nil {
+		t.Fatalf("WriteDefault: %v", err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gen struct {
+		Features map[string]any `json:"features"`
+	}
+	if err := json.Unmarshal(raw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := gen.Features["reasoning_history"]
+	if !ok {
+		t.Errorf("生成的配置缺少 features.reasoning_history 键：%v", gen.Features)
+	} else if v != "full" {
+		t.Errorf("reasoning_history 默认应为 full，实际 %v", v)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("缺省加载档位 = %q want full", c.Features.ReasoningHistory)
+	}
+}
+
+// TestReasoningHistoryHotApplied 面板「需重启」清单：档位是热改项（SetReasoningHistory
+// 原子生效），不得出现在清单里误导用户。
+func TestReasoningHistoryHotApplied(t *testing.T) {
+	c := Default()
+	c.Features.ReasoningHistory = "blank"
+	for _, f := range restartRequiredFields(c) {
+		if strings.Contains(f, "reasoning_history") {
+			t.Errorf("restartRequiredFields 含 %q：档位是热改项，不该提示重启", f)
+		}
+	}
+}
+
+// jsonQuoteLiteral 把字符串转成可嵌进 JSON 的引号字面量（测试内构造 body 用）。
+func jsonQuoteLiteral(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// TestConfigExampleHasReasoningHistoryKey config.example.json 必须带上新键
+// （且能被启动路径原样解析）——模板缺键时用户不知道有这个开关存在。
+func TestConfigExampleHasReasoningHistoryKey(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("config.example.json 无法解析: %v", err)
+	}
+	if c.Features.ReasoningHistory != "full" {
+		t.Errorf("example 的 reasoning_history = %q want full（默认档）", c.Features.ReasoningHistory)
+	}
+	var gen struct {
+		Features map[string]any `json:"features"`
+	}
+	if err := json.Unmarshal(raw, &gen); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gen.Features["reasoning_history"]; !ok {
+		t.Errorf("config.example.json 缺 features.reasoning_history 键：%v", gen.Features)
+	}
+}

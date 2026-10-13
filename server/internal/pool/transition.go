@@ -1,0 +1,214 @@
+// 账号状态机迁移的唯一权威实现。
+//
+// entry 的「可选择性」由六个正交维度决定：禁用(disabled)、临时停用(manualDisabled)、
+// 账号级冷却(until/coolKind)、模型级冷却(modelCooldowns)、熔断(breakerUntil)、
+// 连败降权(degradeUntil)。维度之间以「迁移原语」收拢，禁止在其他文件散写这些字段——
+// 所有入口（applyErrorPolicy / refresh / keepalive / 签到 / 选号 / 面板运维）对状态的
+// 改动都必须经本文件的原语或经 Cooldown/NoteError/NoteSuccess 等封装（它们在持锁下
+// 调用本文件原语）。
+//
+// 迁移矩阵（事件 → 动作 → 字段）：
+//
+//	disabled           ← disableLocked（Disable / NoteSessionDead 达阈 / NoteAccountFault 达阈）
+//	manualDisabled     ← setManualDisabledLocked（面板运维端点；只置位不清其他维度）
+//	until/coolKind     ← Cooldown(CoolSoft/Hard，固定时长) / CooldownSoftRate / CooldownSoftForModel 无解析分支
+//	modelCooldowns     ← CooldownSoftForModel 有解析分支；被 disableLocked/Cooldown/clearCoolingLocked（整域）清，
+//	                     单模型提前解冻走 clearModelCooldownLocked（ClearModelCooldown）；
+//	                     reviveCoolingLocked（余额恢复解冻）**不清**——余额恢复不构成限流解除证据（602ed1b）
+//	breakerUntil       ← recordBreakerFailureLocked（NoteError 唯一喂入）；NoteSuccess 清
+//	softStreak         ← CooldownSoftRate / CooldownSoftForModel 无解析分支；NoteSuccess/Revive 清
+//	                     （reviveCoolingLocked 不清：退避计数与余额无关）
+//	sessionDeadFails   ← NoteSessionDead；ClearSessionDead/NoteSuccess/ReviveDisabled 清
+//	accountFaultFails  ← NoteAccountFault；ClearAccountFault/NoteSuccess/ReviveDisabled/Revive 清
+//	consecutiveFails   ← NoteFailures（degrade.go，唯一喂入）；NoteSuccess/Revive 清
+//	degradeUntil       ← NoteFailures 达阈（固定时长，不做指数）；NoteSuccess/Revive 清
+//
+// 关键正交性（疑点 4 修正）：
+//   - 冷却域（until/coolKind/softStreak/modelCooldowns）与熔断器（fails/retryCount/
+//     breakerUntil）正交：冷却管「近期被限流/余额耗尽」，熔断管「反复 5xx 失败」。
+//     disableLocked 只清冷却域、不动熔断——禁用是授权/session 终态，不应覆盖熔断观测。
+//   - 连败降权（consecutiveFails/degradeUntil）与上述两域都正交：喂入口只有 NoteFailures
+//     （ErrClient/传输层这类「不罚号」失败），不读不写 fails/softStreak/until；
+//     clearCoolingLocked 不清它（禁用/余额解冻都不构成「连败根因已消失」的证据），
+//     只有 NoteSuccess（成功即回池）与 Revive（人工无条件恢复）清。
+//   - 临时停用（manualDisabled）与永久禁用（disabled）各自独立：前者是**运维意图**
+//     （只能由面板运维入口清除），后者是**系统判定**（可被重新登录/成功路径撤销）。
+//     二者都不清对方，并存时 /status 分别透出（见 entry.go Status.manual_disabled /
+//     disabled 注释）。禁用/停用都不碰冷却与熔断维度——解除后拿到的是这段时间里
+//     真实发生过的状态，而不是被清空的一刀切。
+//   - clearCoolingLocked 是「冷却域归零」的单一来源，被 disableLocked 与 Revive 共用
+//     （禁用是终态、人工解冻是无条件恢复，两者都该整域归零）。
+//     reviveCoolingLocked（余额恢复解冻）**不再**走整域归零：它只解冻 CoolHard
+//     （余额恢复正是硬冷却的权威恢复证据），软限流退避与模型级台账各有自身恢复
+//     时刻，不得被 5 分钟一次的余额刷新周期任务抹掉（吸收上游 602ed1b，详见
+//     reviveCoolingLocked 注释）。
+package pool
+
+import "time"
+
+// clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
+// reason 一并清空。熔断器（fails/retryCount/breakerUntil）与连败降权
+// （consecutiveFails/degradeUntil）不属冷却域，不动。
+// 调用方必须已持有 p.mu。
+func (e *entry) clearCoolingLocked() {
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	e.softStreak = 0
+	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
+}
+
+// clearAccountCooldownLocked 清**账号级**冷却字段（until/coolKind/reason/softStreak），
+// **保留 modelCooldowns**（其他模型仍有效的冷却条目原样留着）。
+//
+// 与 clearCoolingLocked 的分工：那个是「冷却域整体归零」（禁用/复活/硬冷却解冻时用，
+// 模型级豁免随之消失是对的——账号整体退出选号或整体恢复）；本函数服务「单模型的
+// 成功证据只解除账号级冷却、不动其他模型负缓存」的场景——后台冷却探活
+// （probe.go CooldownProbeSuccess）的账号级维度。账号级软冷却到期本身不构成
+// 「其他被限流模型已恢复」的证据，故 modelCooldowns 必须原样保留。
+//
+// softStreak 一并清零：它与 until/coolKind 同属冷却域（见 entry.softStreak 注释），
+// 且本次清账的触发条件正是「账号刚被上游实测证明可用」——与 NoteSuccess 的恢复
+// 语义一致（恢复即清零，退避回基数）。注意这与 reviveCoolingLocked 不同：那个的
+// 证据只是「余额有钱」，不构成限流已解除的证据，故保留 softStreak（602ed1b）。
+// 熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
+// 连败降权（consecutiveFails/degradeUntil）同样不动：本函数的触发条件是「冷却已到期
+// 且上游实测可用」，而降权的独立证据链是「ErrClient/传输层连败」——探活请求成功
+// 不经过 NoteSuccess（探活不是用户流量，不写成功统计），故**不**在这里顺手清降权；
+// 降权号按 degradeUntil 到期自行放行（若探活目标恰好是降权号，其请求成功也只解冻
+// 冷却维度，降权仍按自己的截止走）。这样探活的「失败零惩罚」与「只清冷却」两条
+// 边界都不被破坏。
+// 调用方必须已持有 p.mu 写锁，并负责置 dirty。
+func (e *entry) clearAccountCooldownLocked() {
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	e.softStreak = 0
+}
+
+// clearModelCooldownLocked 清单个 (账号, 模型) 的模型级冷却记录，返回是否确有条目被删。
+// 只动 modelCooldowns[model] 一个键：其他模型的冷却、账号级冷却域（until/coolKind/
+// softStreak/reason）与熔断器（fails/retryCount/breakerUntil）全部原样——单模型被
+// 证明可用不构成账号级恢复的证据。map 为 nil 或 key 不存在时是空操作（返回 false）。
+// 调用方必须已持有 p.mu 写锁，并负责置 dirty。
+func (e *entry) clearModelCooldownLocked(model string) bool {
+	if _, ok := e.modelCooldowns[model]; !ok {
+		return false
+	}
+	delete(e.modelCooldowns, model)
+	if len(e.modelCooldowns) == 0 {
+		e.modelCooldowns = nil // 空表归 nil：与 clearCoolingLocked/落盘口径一致（不残留空 map）
+	}
+	return true
+}
+
+// ClearModelCooldown 清除指定 (账号, 模型) 的模型级冷却记录，返回是否真清了。
+//
+// 语义：面板「测试」（POST /panel/api/account/test_chat）成功 = 该模型在此账号上刚刚
+// 被上游实测证明可用 → 立刻解除这条负缓存，不必再等 TTL/重置墙钟。覆盖两种承载语义：
+//   - 6004 模型级限流：提前失效，切回该模型不再被 healthyForModel 拦截（限流豁免提前生效）；
+//   - 11102「该后端无此模型」：负缓存提前失效，无需等 6h 起步的指数退避到期。
+//
+// 边界（刻意收窄，勿在后续迭代"顺手"放宽）：
+//   - 只清这一个模型的条目：其他模型、账号级冷却（until/coolKind/softStreak）与熔断
+//     运行态全部不动——一次单模型成功不构成账号级恢复的证据（与 NoteSuccess 不碰
+//     modelCooldowns 的既有正交性互为对偶）。
+//   - 账号不存在 / model 条目不存在均为空操作，返回 false（调用方据此决定是否打日志）。
+//   - 不清 reason 前缀分流：6004 与 11102 都清。二者都表达"该模型在此账号上不可用"，
+//     而本入口的触发条件正是"该模型刚刚可用"，前提被证伪即应解除（与 BlockModelClear
+//     只认 11102 的窄口径不同：那是 chat 成功路径的最小改动，这里是人工诊断的显式解冻）。
+func (p *Pool) ClearModelCooldown(uid, model string) bool {
+	if uid == "" || model == "" {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || !e.clearModelCooldownLocked(model) {
+		return false
+	}
+	p.dirty.Store(true)
+	return true
+}
+
+// disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
+//
+// 旧 Disable 只置 disabled+reason，不碰 until/modelCooldowns/softStreak，会出现
+// 「disabled=true 但 cooling=true / 残留 modelCooldowns」的一致性问题——一个先被
+// 硬冷却（到次日 04:00）再被禁用的账号会同时呈现两种状态。禁用后冷却无意义
+// （账号已退出选号，冷却截止不再被读取），故一并清空。
+//
+// 熔断器保留：熔断是「连续 5xx 失败」信号（与授权/会话无关），禁用后再复活时
+// 熔断观测仍有效，不应被禁用覆盖。
+// 连败降权（consecutiveFails/degradeUntil）同样保留：它是「ErrClient/传输层连败」
+// 信号，与授权/会话无关；禁用期间计数继续累计（keepalive 跳过 disabled 号，
+// 实际几乎不会增长），复活后若根因未消失应立即按既有进度继续判罚，而不是重新学。
+// 临时停用位（manualDisabled）也不动：本原语表达的是**系统判定**，运维意图不属于
+// 它的清理域——那要由面板运维入口显式解除。
+func (p *Pool) disableLocked(e *entry, reason string) {
+	e.clearCoolingLocked()
+	e.disabled = true
+	e.reason = reason
+	p.dirty.Store(true)
+}
+
+// setManualDisabledLocked 临时停用迁移（面板运维入口）：只置 manualDisabled + 原因，
+// **不清冷却域、不动熔断器、不动连败降权、不碰 disabled**。
+//
+// 与 disableLocked（永久禁用）的关键差异——临时停用是「**对话流量摘除**」而非
+// 「账号冻结」：签到、token 保活、排程任务照常执行（scheduler 只判 Status.Disabled，
+// 见 internal/scheduler/scheduler.go:412/469/536/570），账号凭证与积分状态都是活的。
+// 因此刻意不碰 until/coolKind/modelCooldowns/breakerUntil/degradeUntil：停用期间这些
+// 维度继续按各自规律演进（冷却自然到期、熔断计数继续累计），恢复时拿到的是「停用期间
+// 真实发生过什么」的完整状态，而不是被清空的一刀切。
+//
+// 为什么用独立状态位而非复用 disabled：我们的 disabled 会被自动路径撤销（重新登录
+// 走 Revive，见 internal/panel/login.go:242；任意成功走 NoteSuccess 清惩罚态），
+// 运维意图若复用同一字段会被这些路径意外解除——这正是上游引入独立位的理由。
+// 两位独立、各自清除，都清空才回到选号池。
+// 调用方必须已持有 p.mu。
+func (p *Pool) setManualDisabledLocked(e *entry, disabled bool, reason string) {
+	e.manualDisabled = disabled
+	if disabled {
+		e.manualReason = reason
+	} else {
+		e.manualReason = ""
+	}
+	p.dirty.Store(true)
+}
+
+// reviveCoolingLocked 余额恢复解冻：只清**余额耗尽冷却**（CoolHard 的
+// until/coolKind/reason）并更新 credits/creditsTotal。
+//
+// 调用方只有 ReenableIfCredits（余额刷新/签到），且**仅对硬冷却（CoolHard）**放行
+// （issue #199 收窄）：硬冷却的恢复条件正是「余额恢复」，签到到账即解冻；
+// 软冷却（CoolSoft/6004 模型级）的恢复时刻由上游重置墙钟或有界退避决定，余额恢复
+// 不构成解冻依据——旧实现无条件解冻会让软冷却账号被刷新解冻 → 再撞 429 循环。
+// 人工强制解冻走 Revive（无条件恢复，不受本收窄影响）。
+//
+// 为什么不再走 clearCoolingLocked 整域归零（吸收上游 602ed1b，issue #127/#153）：
+// 余额刷新周期任务（默认每 5 分钟，RunBalanceRefreshNow）对 expiring==0 的账号
+// 反复到达这里，整域归零会把 **6004 模型级台账**（对齐上游重置墙钟）与
+// **CoolSoft 软限流 + softStreak 退避计数**一并抹掉——任何限流冷却的实际寿命都被
+// 压到一个刷新周期（≤5min）内：撞限号被误判健康后重新选中再撞 429，全池冷却保护
+// 形同虚设。上游两号池实测指纹：expiring==0 的号每 5 分钟被抹一次台账，expiring>0
+// 的号走 SetCreditsDetailed 幸免，两号行为不对称。
+//
+// 各维度的**权威恢复证据**（本函数的清理边界即由此划出）：
+//   - CoolHard until/coolKind/reason ← 余额恢复（本函数照旧解冻，remain>0 即证据）；
+//   - CoolSoft / softStreak ← 上游重置墙钟到期或 NoteSuccess（成功是最强证据）；
+//     余额有钱与该模型/账号的限流是否解除无关，故保留（由自然到期或成功收敛）；
+//   - modelCooldowns（6004 台账）← 上游重置墙钟到期、探测成功或人工 Revive；
+//   - 熔断器（fails/retryCount/breakerUntil）← 余额恢复只证明 billing 通道健康，
+//     不证明 chat 通道健康，故照旧不动（C5 语义不变）。
+//
+// 调用方必须已持有 p.mu。
+func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
+	e.credits = credits
+	e.creditsTotal = total
+	if e.coolKind == CoolHard {
+		e.until = time.Time{}
+		e.coolKind = 0
+		e.reason = ""
+	}
+}

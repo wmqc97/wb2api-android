@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WorkBuddy 网关</string>
+    <string name="channel_name">网关服务</string>
+    <string name="channel_desc">保持 WorkBuddy2API 网关常驻运行</string>
+    <string name="loading">正在启动网关服务…</string>
+    <string name="menu_more">更多</string>
+    <string name="action_reload">刷新面板</string>
+    <string name="action_restart">重启网关服务</string>
+    <string name="action_logs">查看运行日志</string>
+    <string name="action_copy">复制访问地址与密钥</string>
+    <string name="action_copy_key">复制 API 密钥</string>
+    <string name="action_checkin_all">一键全部签到</string>
+    <string name="action_run_all_tasks">执行所有任务</string>
+    <string name="action_settings">设置</string>
+    <string name="action_battery">忽略电池优化</string>
+    <string name="action_open_browser">浏览器打开面板</string>
+    <string name="action_update">检测更新</string>
+    <string name="action_upstream">访问上游项目</string>
+    <string name="action_about">关于</string>
+    <string name="retry">重试</string>
+</resources>

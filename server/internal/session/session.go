@@ -1,0 +1,554 @@
+// Package session 会话粘性路由：同一会话（conversationId / metadata 键）尽量绑定同一账号。
+//
+// 设计参考 antigravityProxyGo internal/session（fast-path RLock / 双段分配 / TTL / 持久化），
+// 但改为纯内存 + redisstore 异步镜像：
+//   - 命中走 RLock 快查（绝大多数请求已绑定）；
+//   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
+//   - 分配按选号模式分两支（见 Config.Sequential）：
+//     weighted（缺省）优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
+//     sequential 取候选列表第一个（pool.AvailableUIDs 已按 pool.Order() 排序）——集中填充；
+//   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
+//   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
+package session
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"log"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+)
+
+// entry 单条会话绑定。
+type entry struct {
+	uid        string
+	lastActive time.Time
+}
+
+// Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
+// 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
+type Config struct {
+	// TTL 会话绑定 TTL 的**启动初值**：New 时写入 Router.ttlNanos（原子），此后
+	// 运行期一律经 Router.TTL()/SetTTL() 读写，本字段不再被读取——面板热改 TTL
+	// （saveConfig → SetTTL）改的是原子值，不回写配置结构。
+	TTL        time.Duration
+	GCInterval time.Duration
+	Store      redisstore.Store
+	Available  func() []string
+	// AvailableForModel 按请求模型返回"在该模型上可用"的账号（healthy 且未占满在途，
+	// 且未被该模型限流/限额）。nil 时回落 Available（无模型维度，行为与引入前一致）。
+	//
+	// 为什么粘性需要模型维度：绑定只记 uid，而同一个会话可能换模型。账号被 6004
+	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
+	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
+	AvailableForModel func(model string) []string
+	// Sequential 选号模式（pool.pick_mode=sequential）的**启动初值**：与 TTL 同口径，
+	// New 时写入 Router.sequential（原子），此后运行期一律经 Router.Sequential()/
+	// SetSequential() 读写，本字段不再被读取——面板热改 pick_mode（saveConfig →
+	// SetSequential）改的是原子值，不回写配置结构。
+	//
+	// 语义：true 时新会话的分配取候选列表**第一个**（不再哈希分散），与选号侧
+	// pickSequentialLocked 的"集中填充"同源；false（零值，缺省）逐字节保持改动前行为。
+	Sequential bool
+}
+
+// Router 会话粘性路由器。
+type Router struct {
+	mu      sync.RWMutex
+	entries map[string]entry
+	cfg     Config
+	stop    chan struct{}
+	// ttlNanos 当前生效的绑定 TTL（纳秒）。用独立 atomic 而不是复用 mu：
+	// TTL 的读取点既有持 mu 的慢路径（gcOnce / 慢路径分配），也有**未持 mu 的快路径**
+	// （ResolveForModel 的 RLock 段内 expired 判定，见下），把 TTL 塞进 entries 的
+	// 同一把锁会把两件无关的事耦合起来（且快路径读锁下无法安全写 TTL）。
+	// 0 = 未初始化（理论不可达：New 一定写入非正值兜底后的默认 30m）。
+	ttlNanos atomic.Int64
+	// sequential 当前生效的选号模式（pool.pick_mode=sequential）。与 ttlNanos 同口径：
+	// 独立 atomic，面板热改（SetSequential）与分配读侧（ResolveForModel 慢路径）零耦合。
+	// false（零值）= weighted（缺省，改动前行为）。
+	sequential atomic.Bool
+}
+
+// New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
+// TTL/GCInterval 非正取默认（30m / 5m）——main 从 config 解析后传入，这里兜底。
+func New(cfg Config) *Router {
+	if cfg.Store == nil {
+		cfg.Store = redisstore.Noop{}
+	}
+	if cfg.TTL <= 0 {
+		cfg.TTL = 30 * time.Minute
+	}
+	if cfg.GCInterval <= 0 {
+		cfg.GCInterval = 5 * time.Minute
+	}
+	r := &Router{entries: map[string]entry{}, cfg: cfg}
+	r.ttlNanos.Store(int64(cfg.TTL))
+	r.sequential.Store(cfg.Sequential)
+	return r
+}
+
+// TTL 返回当前生效的绑定 TTL（原子读，任意时刻安全：快路径/慢路径/GC 都可能调）。
+func (r *Router) TTL() time.Duration {
+	return time.Duration(r.ttlNanos.Load())
+}
+
+// SetTTL 热更新绑定 TTL（面板保存配置路径调用：cmd/server saveConfig → SetTTL）。
+//
+// 语义是"对新判定生效、不做追溯"：已存在的绑定不因 TTL 缩短而立刻失效，下一次
+// expired 判定（快路径惰性过期 / 慢路径 re-check / gcOnce）才按新值算——与读时
+// 惰性判定天然一致，不需要遍历 entries 重算，也不需要触锁。
+// d<=0 视为「未设置」回落默认 30m（与 New 的兜底口径一致，避免面板清空该字段后
+// 把所有绑定瞬间判为过期、粘性全丢）。
+//
+// 为什么用 atomic 而不是 mu：Read 侧有**未持锁**路径（ResolveForModel 快路径 RLock
+// 段内 / GC 写锁段内），并且 GCInterval 不做热改（见 main 的 restartRequiredFields），
+// 所以不需要借 mu 与 cfg 对齐；原子值让 SetTTL 与所有读取点零耦合、无锁竞争。
+func (r *Router) SetTTL(d time.Duration) {
+	if d <= 0 {
+		d = 30 * time.Minute
+	}
+	r.ttlNanos.Store(int64(d))
+}
+
+// Sequential 返回当前生效的选号模式是否为 sequential（原子读，任意时刻安全）。
+func (r *Router) Sequential() bool {
+	return r.sequential.Load()
+}
+
+// SetSequential 热更新选号模式（面板保存 pool.pick_mode 路径调用：cmd/server
+// saveConfig → SetSequential）。true = sequential：新会话分配取候选列表第一个
+// （集中填充），false = weighted：双段策略 + 哈希分散（改动前行为）。
+//
+// 语义是"对新分配生效、不做追溯"：已存在的绑定不因模式切换而改绑（粘性优先于模式，
+// 与 SetTTL 的"下一次判定才按新值算"同口径）；下一次**新会话分配**才按新模式挑号。
+//
+// 为什么用 atomic 而不是 mu：与 SetTTL 同理——分配读点在 ResolveForModel 慢路径，
+// 面板保存配置在另一个 goroutine（请求期），原子值让两侧零耦合、无锁竞争；
+// 且本开关只有"两种取值"、无需与 entries 同锁对齐。
+func (r *Router) SetSequential(on bool) {
+	r.sequential.Store(on)
+}
+
+// StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
+//
+// stop channel 必须在启 goroutine 前捕获到**局部变量**：goroutine 在 select 里
+// 每轮重新求值 r.stop 是无锁读，而 StopGC 持写锁把它置 nil——既是数据竞争
+// （-race 可复现），又会在读到 nil 后让该 case 永久阻塞（nil channel 永不就绪），
+// 于是关停彻底失效：goroutine 再也不会退出，ticker 无限触发 gcOnce（goroutine
+// 泄漏 + 关停后仍持续 GC）。捕获局部变量后，close(stop) 与 select 观测的是同一个
+// channel，StopGC 一定能让 goroutine 退出。
+func (r *Router) StartGC() {
+	r.mu.Lock()
+	if r.stop != nil {
+		r.mu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	r.stop = stop
+	r.mu.Unlock()
+
+	go func() {
+		t := time.NewTicker(r.cfg.GCInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				r.gcOnce(time.Now())
+			}
+		}
+	}()
+}
+
+// StopGC 停止后台 GC（幂等）。
+func (r *Router) StopGC() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stop != nil {
+		close(r.stop)
+		r.stop = nil
+	}
+}
+
+// LoadFromStore 启动时从 redisstore 恢复绑定（内存覆盖本地，读操作仅此处发生）。
+// 已有本地绑定被保留——Redis 仅为恢复备份，本地一旦建立即为权威。
+func (r *Router) LoadFromStore() {
+	binds := r.cfg.Store.LoadBinds()
+	if len(binds) == 0 {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	loaded := 0
+	for key, uid := range binds {
+		if _, exists := r.entries[key]; exists {
+			continue
+		}
+		r.entries[key] = entry{uid: uid, lastActive: now}
+		loaded++
+	}
+	r.mu.Unlock()
+	if loaded > 0 {
+		log.Printf("[session] 从 Redis 恢复 %d 条粘性会话绑定", loaded)
+	}
+}
+
+// Resolve 返回会话 key 应绑定的账号 uid，ok=false 表示当前无可用账号。
+// 无模型维度（等价于 ResolveForModel(key, "")），保留给不关心模型的调用方。
+func (r *Router) Resolve(key string) (string, bool) {
+	return r.ResolveForModel(key, "")
+}
+
+// ResolveForModel 返回会话 key 在该模型上应绑定的账号 uid。
+// 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
+// 被该模型限流）走重新分配。
+//
+// 为什么必须带模型：绑定只记 uid，同一个会话可能换模型；账号被 6004 模型级限额后
+// 对其他模型仍可用（见 pool.healthyForModel 的 softRateModel 豁免）。若只按账号级
+// 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
+func (r *Router) ResolveForModel(key, model string) (string, bool) {
+	now := time.Now()
+	available := r.availableSet(model)
+	// TTL 取一次快照：本次调用内的两次 expired 判定必须用同一值，否则 SetTTL 插在
+	// 两次判定之间会让同一个 key 在同一次 Resolve 里"先过期后不过期"，语义自相矛盾。
+	ttl := r.TTL()
+
+	// ── Fast path: RLock 快查 ──────────────────────────────
+	r.mu.RLock()
+	e, found := r.entries[key]
+	r.mu.RUnlock()
+	if found && !expired(e, now, ttl) {
+		if available[e.uid] {
+			r.touch(key, e.uid, now)
+			return e.uid, true
+		}
+		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
+	}
+
+	// ── Slow path: 写锁 re-check 后分配 ────────────────────
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// re-check：并发同 key 可能已被其他 goroutine 分配好。
+	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, ttl) {
+		if available[e2.uid] {
+			r.entries[key] = entry{uid: e2.uid, lastActive: now}
+			return e2.uid, true
+		}
+		delete(r.entries, key) // 失效：清掉再分配
+	}
+
+	uids := r.availableSlice(model)
+	if len(uids) == 0 {
+		return "", false
+	}
+
+	uid := r.assign(key, uids)
+
+	prev, existed := r.entries[key]
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	if existed && prev.uid != uid {
+		r.cfg.Store.DelBind(key)
+	}
+	r.cfg.Store.SetBind(key, uid, r.TTL())
+	return uid, true
+}
+
+// assign 从可用候选列表（有序）中挑一个账号给会话 key。调用方必须已持 r.mu 写锁，
+// 且 uids 非空。
+//
+// 两种模式的语义分野（只换"怎么挑候选"这一件事，与 pool 侧 PickMode 的分野同形）：
+//
+// ── sequential（pool.pick_mode=sequential）──────────────────────────────
+// 取 uids[0]，即"顺序第一的可用号"。
+//
+//   - 为什么是第一个：uids 来自 pool.AvailableUIDs(ForModel[Realm])，它已按
+//     Pool.Order()（state.json 顶层 account_order，面板拖拽排序的权威次序）排序，
+//     且已过滤"不健康 / 在途占满"的账号。所以 uids[0] 就是"顺序里第一个此刻真能用的
+//     号"，而顺序第一的号满了/冷却时它自然从列表消失、uids[0] 变成下一个号——
+//     溢出语义**不需要在本函数里写任何逻辑**（与 pickSequentialLocked 同源）。
+//   - 为什么不哈希：顺序模式的语义就是「集中填充」——"保证绝大头在第一个号就行了，
+//     也就是填充模式"（用户原话）。哈希取模的作用恰恰是**反方向**的散列，两者矛盾：
+//     保留哈希会让新会话继续被分散到各个号，顺序第一的号只拿到 1/N 的会话，
+//     顺序模式在"带会话键的客户端"（也就是绝大多数客户端）上完全失效。
+//
+// **双段策略（"空闲账号优先"）在 sequential 下被显式跳过**（即方案 (a) 跳过 idle 段
+// 直接用全池顺序第一个，而不是 (b) 保留 idle 段只改取法）。理由：
+//   - 该策略的原意（见下方 weighted 分支）是"避免多个会话挤在同一个号"——它服务的是
+//     **加权模式**下"打散热点、摊开负载"的目标；
+//   - 顺序模式的目标与之**正好相反**：集中填满第一个号再用下一个。若保留 idle 段，
+//     顺序第一的号一旦被任何会话绑定就退出 idle，新会话会被推到后面的号上——
+//     修复前实测（候选列表已按 order 排好、40 个新会话）顺序第一的号只拿到 20 个，
+//     其余 20 个被散到第二个号，正是用户投诉的"每次挑不同账号"。
+//     故 sequential 下"已绑定"不是"不可用"：`bound` 是会话维度的占用，
+//     而本模式关心的是**账号维度**的在途额度（已由 uids 的 inFlightFull 过滤承载）。
+//   - 副作用是有界的：被绑定的会话继续粘着自己的号（粘性命中路径不受本函数影响），
+//     集中带来的额外成本只是"多一两个请求落在同一个号上"——与用户澄清一致
+//     （"反正只是多一个两个请求而已"）。
+//
+// ── weighted（缺省，改动前行为）──────────────────────────────────────────
+// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池；段内 FNV-1a
+// 哈希取模（同一 key 稳定落同一个号）。本分支与引入 pick_mode 前**逐字节相同**。
+//
+// 为什么 sequential 用原子读而不是持锁读：本函数已持 r.mu 写锁，而模式开关是
+// 独立 atomic（见 SetSequential 注释）——读它不需要也不应该借用 entries 的锁。
+func (r *Router) assign(key string, uids []string) string {
+	if r.sequential.Load() {
+		return uids[0]
+	}
+	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
+	bound := map[string]bool{}
+	for _, v := range r.entries {
+		bound[v.uid] = true
+	}
+	var idle []string
+	for _, u := range uids {
+		if !bound[u] {
+			idle = append(idle, u)
+		}
+	}
+	pool2 := idle
+	if len(pool2) == 0 {
+		pool2 = uids
+	}
+	return pool2[hashIndex(key, len(pool2))]
+}
+
+// touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+func (r *Router) touch(key, uid string, now time.Time) {
+	r.mu.Lock()
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.mu.Unlock()
+	r.cfg.Store.SetBind(key, uid, r.TTL())
+}
+
+// Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
+// 供"粘性跟随最终成功号"用：请求成功返回前，把会话重绑到实际成功的账号，让多轮对话下一跳稳定
+// 收敛到"对该会话持续成功的号"（对齐 antigravity 语义）。空 key 直接返回（无会话则不绑）。
+func (r *Router) Bind(key, uid string) {
+	if key == "" || uid == "" {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	r.mu.Unlock()
+	r.cfg.Store.SetBind(key, uid, r.TTL())
+}
+
+// Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
+func (r *Router) Unbind(key string) bool {
+	r.mu.Lock()
+	_, found := r.entries[key]
+	if found {
+		delete(r.entries, key)
+	}
+	r.mu.Unlock()
+	if found {
+		r.cfg.Store.DelBind(key)
+	}
+	return found
+}
+
+// Count 返回当前绑定数（供 /status 观测）。
+func (r *Router) Count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.entries)
+}
+
+// gcOnce 清理 TTL 过期的绑定，并镜像删除。
+func (r *Router) gcOnce(now time.Time) int {
+	ttl := r.TTL() // 与 ResolveForModel 同口径：本轮 GC 统一用一个 TTL 快照
+	r.mu.Lock()
+	var expiredKeys []string
+	for key, e := range r.entries {
+		if now.Sub(e.lastActive) > ttl {
+			expiredKeys = append(expiredKeys, key)
+		}
+	}
+	for _, key := range expiredKeys {
+		delete(r.entries, key)
+	}
+	r.mu.Unlock()
+	for _, key := range expiredKeys {
+		r.cfg.Store.DelBind(key)
+	}
+	return len(expiredKeys)
+}
+
+// availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
+func (r *Router) availableSet(model string) map[string]bool {
+	uids := r.availableSlice(model)
+	set := make(map[string]bool, len(uids))
+	for _, u := range uids {
+		set[u] = true
+	}
+	return set
+}
+
+// availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。
+func (r *Router) availableSlice(model string) []string {
+	if r.cfg.AvailableForModel != nil {
+		return r.cfg.AvailableForModel(model)
+	}
+	if r.cfg.Available == nil {
+		return nil
+	}
+	return r.cfg.Available()
+}
+
+func expired(e entry, now time.Time, ttl time.Duration) bool {
+	return now.Sub(e.lastActive) > ttl
+}
+
+// hashIndex FNV-1a 哈希取模（antigravity 双段分配的稳定散列）。
+func hashIndex(key string, n int) int {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return int(h % uint32(n))
+}
+
+// ExtractKey 从请求体提取会话键；按下列顺序依次尝试，找不到时回退到
+// 内容派生的稳定键（见 deriveKey），仍为空则返回空串（绝不失败）。
+//  1. metadata.conversation_id
+//  2. metadata.conversationId
+//  3. conversation_id
+//  4. conversationId
+//  5. prompt_cache_key（客户端显式声明的会话级前缀缓存键）
+//  6. 派生键：system 提示词 + 首条用户消息的内容签名哈希（客户端不发会话 id 时的回退）
+//
+// 1-4 均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+// （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
+// user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
+// 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
+// （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
+// （7d 兜底）自然过期，键消失不产生脏绑定。
+// 该契约对第 6 项派生键同样成立（deriveKey 内的 hasUserID 闸门）：带 user_id 的
+// 请求不派生内容键，否则只发 user_id 的客户端会借首条 prompt 绕过上述剔除。
+//
+// issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
+// 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
+// snake_case 优先级高于 camelCase（同值不同名命中同一对话时返回相同值，天然不混用）。
+//
+// 第 5 项 prompt_cache_key：部分 OpenAI 系客户端（pi-ai 驱动的 dsh 等）把会话 ID
+// 放在这个前缀缓存字段里而非 conversation_id——语义与粘性同源（"同一会话复用同一
+// 前缀"）。上游同款实现亦取此字段。置于 conversation 维度四键**之后**、内容派生
+// **之前**：绝不抢占显式 conversation 维度，但优先于内容猜测（客户端已明确声明
+// 会话身份，比网关从内容反推更可信）。
+//
+// 注意：网关出站时会自行注入 prompt_cache_key（upstream.InjectPromptCacheKey，按
+// 账号隔离），但那是**出站改写**，入站 body 里没有该字段，不会自我污染粘性键。
+func ExtractKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return ""
+	}
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if v := strOrEmpty(meta["conversation_id"]); v != "" {
+			return v
+		}
+		if v := strOrEmpty(meta["conversationId"]); v != "" {
+			return v
+		}
+	}
+	if v := strOrEmpty(obj["conversation_id"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
+		return v
+	}
+	return deriveKey(obj)
+}
+
+// derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
+// 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
+const derivedKeyPrefix = "d-"
+
+// deriveKey 从消息内容派生稳定会话键：SHA-256(system 内容 + 首条 user 内容签名)
+// 前 16 字节，前缀 d-。
+//
+// 为什么用「system + 首条 user」而不是全部消息：
+//   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
+//   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
+//   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
+//   - system 一并入键（相对上游同款只哈希首条 user 的差异）：网关可改写系统
+//     提示词（custom / passthrough / 降级），system 不同即上游前缀缓存边界不同，
+//     纳入键能避免"同首条提问但提示词体系不同"的两段会话共用绑定。
+//
+// 抑制条件（P1-anti-monopoly 契约）：body 携带 metadata.user_id 或顶层 user_id 时
+// **恒返回空串**。ExtractKey 有意剔除 user_id 作粘性键（ebd7921：user 维度粒度过粗
+// ——一个 user 的全部并行对话会被钉到同一账号，远粗于上游对话级缓存边界），但内容
+// 派生是**另一条**会给出非空键的路径：若不设闸，只发 user_id 的客户端会借首条
+// prompt 重新获得粘性，使该契约在派生路径失效（上游 10eefa8 修的同款回归）。
+//
+// 取不到可签名内容（纯图片轮已由 contentSignatureAny 签名，见 ids.go；空/null/
+// 未知形态仍为空）时返回空串：不粘性，退回普通轮换（安全降级）。
+func deriveKey(obj map[string]any) string {
+	if hasUserID(obj) {
+		return ""
+	}
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return ""
+	}
+	systemSig, firstUserSig := "", ""
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		sig := contentSignatureAny(msg["content"])
+		switch strOrEmpty(msg["role"]) {
+		case "system", "developer":
+			if systemSig == "" {
+				systemSig = sig
+			}
+		case "user":
+			if firstUserSig == "" {
+				firstUserSig = sig
+			}
+		}
+		if firstUserSig != "" && systemSig != "" {
+			break // 都已拿到：停止遍历长历史
+		}
+	}
+	if firstUserSig == "" {
+		return "" // 无用户消息（或首条 user 无可签名内容）：无从归属会话
+	}
+	sum := sha256.Sum256([]byte(systemSig + "\x00" + firstUserSig))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// hasUserID 报告 body 是否携带 user 维度标识（metadata.user_id 或顶层 user_id）。
+// 只判"字段存在且为非空字符串"，与 ExtractKey 的 strOrEmpty 口径一致；非字符串
+// 与空串都不算标识（不抑制派生——与上游 10eefa8 的边界一致）。
+func hasUserID(obj map[string]any) bool {
+	if meta, ok := obj["metadata"].(map[string]any); ok {
+		if strOrEmpty(meta["user_id"]) != "" {
+			return true
+		}
+	}
+	return strOrEmpty(obj["user_id"]) != ""
+}
+
+// strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。
+func strOrEmpty(v any) string {
+	s, _ := v.(string)
+	return s
+}

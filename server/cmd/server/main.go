@@ -1,0 +1,804 @@
+// main.go workbuddy2api 入口：加载配置、构建 pool、起调度器与 HTTP 服务。
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+)
+
+// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
+//
+// 这里是**本地构建的默认值**；正式发布由 CI 从 git tag 注入：
+//
+//	go build -ldflags "-X main.appVersion=v1.9.2"
+//
+// 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
+// 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
+// 单一来源 = git tag，产物版本号永远可复现、无后缀。
+var appVersion = "v1.9.38"
+
+// usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
+// 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
+func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usage.json") }
+
+// stateSibling 返回与 state 文件同目录的指定文件名路径（相对路径场景回落当前目录）。
+// usage.json（用量记录）与 output_probes.json（模型上限探测）共用本规则。
+func stateSibling(stateFile, name string) string {
+	dir := filepath.Dir(stateFile)
+	if dir == "" || dir == "." {
+		return name
+	}
+	return filepath.Join(dir, name)
+}
+
+// boolPtr 返回 v 的指针。用途：把「布尔开关的**默认值**」与「显式 false」区分开——
+// server.Config 里少数开关（如 PTLMaxTokensRetry）用 *bool 表达「未配置 = 用默认 true」，
+// 裸 bool 的零值 false 会被误读成「显式关闭」。
+func boolPtr(v bool) *bool { return &v }
+
+func main() {
+	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
+	flag.Parse()
+
+	cfg, err := Load(*cfgPath)
+	if err != nil {
+		// errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
+		if errors.Is(err, fs.ErrNotExist) {
+			// 首次运行：目录下没有配置 → 自动落一份推荐配置（含随机 api_key）再加载。
+			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
+			if key, werr := WriteDefault(*cfgPath); werr == nil {
+				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
+				cfg, err = Load(*cfgPath)
+			}
+			if err != nil {
+				// 生成失败（目录只读等）：退回纯默认 + env（旧行为兜底），不阻塞启动。
+				log.Printf("config %s not found (auto-generate failed), using defaults+env: %v", *cfgPath, err)
+				cfg, err = Load("")
+			}
+		}
+		if err != nil {
+			log.Fatalf("load config: %v", err)
+		}
+	}
+
+	auths, err := auth.LoadDir(cfg.AuthDir)
+	if err != nil {
+		log.Fatalf("load auths: %v", err)
+	}
+	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+
+	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
+	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
+
+	p := pool.New(cfg.StateFile)
+	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（消除 goroutine 泄漏）
+	p.SetStore(store)
+	p.RestoreFromSnapshot() // 择新恢复：Redis 快照不早于本地才采用；本地缺失/不可读时采用快照
+	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+
+	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
+	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
+	// 连败降权（issue #114）：ErrClient/传输层连败 N 次临时出池（非正值回退默认）。
+	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
+	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
+	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
+	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// 选号模式（pool.pick_mode，缺省 weighted = 改动前行为）：sequential 时按账号列表
+	// 顺序（state.json 顶层 account_order）填充式选号，某号在途满则临时溢出给下一个。
+	// 面板改配置后经 saveConfig 热生效（无需重启）。
+	p.SetPickMode(PickMode(cfg.Pool.PickMode))
+	// 保留积分线（pool.reserve_credits，缺省 50）：余额 ≤ 该线的账号只对免费/低价模型可用，
+	// 贵模型跳过它换别的号（用户需求：别让贵模型把积分吃到连免费的 4.1 都用不了）。
+	// 免费判定是模型感知的（倍率口径 + 兜底白名单，见 internal/pool/reserve.go 文件头）；
+	// 判定回调在下方 up 构造后经 SetFreeModelLookup 注入（回调要闭包捕获 client）。
+	p.SetReserveCredits(int64(cfg.Pool.ReserveCredits))
+
+	// 会话粘性路由（可配关闭）。
+	var sessRouter *session.Router
+	redisMode := "noop"
+	if _, ok := store.(redisstore.Noop); !ok {
+		redisMode = "upstash"
+	}
+	if cfg.SessionSticky.Enabled {
+		// 装配（含 pool.pick_mode → 粘性侧的顺序开关）见 wiring.go 的 newSessionRouter：
+		// 与 cmd/server 的接线测试共用同一份，避免"测试另写装配"漏掉接线回归。
+		sessRouter = newSessionRouter(cfg, p, store)
+		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+		sessRouter.StartGC()
+		defer sessRouter.StopGC()
+	}
+	sessCount := func() int {
+		if sessRouter != nil {
+			return sessRouter.Count()
+		}
+		return 0
+	}
+
+	up := upstream.New()
+	// 保留积分的「免费/低价模型」判定回调（pool.reserve_credits 的模型感知部分）：
+	// 数据源是 CN（cachedCatalogSnapshot）与 global（GlobalModelInfosStaleSnapshot）两个
+	// **只读目录快照**（都陈旧容错：超 TTL 后仍按最近一次成功目录作答，避免刷新空档期
+	// 把免费模型误拦）——回调在选号热路径上被调用，绝不发起上游请求（与 /v1/stats
+	// 的倍率透出同一纪律）。契约与取舍见 internal/server/freemodels.go。
+	p.SetFreeModelLookup(server.FreeModelLookup(up))
+	// 连接层四项（h2 开关 / TLS 握手 / 拨号 / 空闲池）按配置重建共享 Transport：
+	// Transport 是 HTTP 与 ChatHTTP 的共享实例（连接池不重复），ConfigureTransport
+	// 同步替换两者。配置缺键 = TransportOpts 零值 = **h2 启用** + 30/30/90，与用户
+	// 实测结论一致（TUN 代理下 h2 复用 90%，禁 h2 复用率 0%）。
+	// 重建放在最前：后续按 config 覆盖的 client/transport 字段一律落在最终实例上。
+	up.ConfigureTransport(upstream.TransportOpts{
+		DisableHTTP2:        cfg.Upstream.DisableHTTP2,
+		TLSHandshakeTimeout: time.Duration(cfg.Upstream.TLSHandshakeTimeoutSeconds) * time.Second,
+		DialTimeout:         time.Duration(cfg.Upstream.DialTimeoutSeconds) * time.Second,
+		IdleConnTimeout:     time.Duration(cfg.Upstream.IdleConnTimeoutSeconds) * time.Second,
+	})
+	if cfg.Upstream.DisableHTTP2 {
+		log.Printf("上游连接层：HTTP/2 已禁用（HTTP/1.1）；TLS 握手 %ds / 拨号 %ds / 空闲池 %ds",
+			cfg.Upstream.TLSHandshakeTimeoutSeconds, cfg.Upstream.DialTimeoutSeconds, cfg.Upstream.IdleConnTimeoutSeconds)
+	} else {
+		log.Printf("上游连接层：HTTP/2 启用；TLS 握手 %ds / 拨号 %ds / 空闲池 %ds",
+			cfg.Upstream.TLSHandshakeTimeoutSeconds, cfg.Upstream.DialTimeoutSeconds, cfg.Upstream.IdleConnTimeoutSeconds)
+	}
+	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
+	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
+	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
+	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
+		tr.ResponseHeaderTimeout = up.HeaderTimeout
+	}
+	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
+	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	// 脱敏两开关 + 历史推理裁剪档位经 Client 的 atomic setter 写入（面板保存配置会在
+	// 请求期并发热改，裸字段赋值是数据竞争）。此处为启动装配期，与请求路径无并发，
+	// 但走同一 API 保持唯一写入口。
+	up.SetSanitizeFingerprints(cfg.Features.SanitizeBlacklistFingerprints)
+	up.SetZeroWidthSanitize(cfg.Features.ZeroWidthSanitize)
+	up.SetReasoningHistory(cfg.Features.ReasoningHistory)
+	// 出站 UA 与归属头（issue #42 + 上游同步）：
+	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
+	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
+	up.UserAgent = cfg.Upstream.UserAgent
+	up.ClientVersion = cfg.Upstream.ClientVersion
+	up.CliVersion = cfg.Upstream.CliVersion
+	up.ClientName = cfg.Upstream.ClientName
+	up.DeviceToken = cfg.Upstream.DeviceToken
+	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 账号级设备指纹头（X-Machine-ID / X-Session-ID，按 uid 固定盐派生）：
+	// chat/billing/模型目录业务路径注入（refresh/auth 不注入）；
+	// false = 完全还原旧行为。装配期写入，改动需重启。
+	up.MachineIDHeaders = cfg.Upstream.MachineIDHeaders
+	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
+	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
+	up.GlobalEnabled = cfg.Global.Enabled
+	up.ChatBaseGlobal = cfg.Global.ChatBase
+	up.BillingBaseGlobal = cfg.Global.BillingBase
+	auth.SetGlobalEnabled(cfg.Global.Enabled)
+
+	sch := scheduler.New(scheduler.Config{
+		Pool:           p,
+		Upstream:       up,
+		CheckinHours:   cfg.Schedule.CheckinHours,
+		TravelHours:    cfg.Schedule.TravelHours,
+		ActivityHours:  cfg.Schedule.ActivityHours,
+		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		GrowthHours:    cfg.Schedule.GrowthHours,
+		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
+		ExpiringSoonWindow: cfg.ExpiringSoonDur,
+		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:     !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
+		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
+		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
+		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+	})
+	switch {
+	case !cfg.Schedule.CheckinEnabled:
+		log.Printf("签到已禁用（schedule.checkin_enabled=false）")
+	default:
+		log.Printf("签到已启用：%v 点（签到 + 余额查询解冻）", cfg.Schedule.CheckinHours)
+	}
+	switch {
+	case !cfg.Schedule.TravelEnabled:
+		log.Printf("猫猫旅行已禁用（schedule.travel_enabled=false）")
+	default:
+		log.Printf("猫猫旅行已启用：%v 点（独立排程：领养 / 派出 / 领奖）", cfg.Schedule.TravelHours)
+	}
+	switch {
+	case !cfg.Schedule.ActivityEnabled:
+		log.Printf("活跃上报已禁用（schedule.activity_enabled=false）")
+	default:
+		log.Printf("活跃上报已启用：%v 点（每日 1 次，点亮连登 + 解锁 first_buddy）", cfg.Schedule.ActivityHours)
+	}
+	if !cfg.Schedule.KeepaliveEnabled {
+		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
+	} else {
+		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
+	}
+	switch {
+	case !cfg.Schedule.BlackcatEnabled:
+		log.Printf("夜猫子已禁用（schedule.blackcat_enabled=false）")
+	default:
+		log.Printf("夜猫子已启用：%v 点（23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
+	}
+	switch {
+	case !cfg.Schedule.GrowthEnabled:
+		log.Printf("成长任务自动执行已禁用（schedule.growth_enabled=false）")
+	default:
+		log.Printf("成长任务自动执行已启用：%v 点（扫描+执行全部待办，Sequential 链零点解锁后自动推进）", cfg.Schedule.GrowthHours)
+	}
+	switch {
+	case !cfg.Schedule.BalanceRefreshEnabled:
+		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
+	case cfg.BalanceRefreshInterval > 0:
+		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
+	}
+	switch {
+	case !cfg.Schedule.AuthWatchEnabled:
+		log.Printf("auths 目录热加载已禁用（schedule.auth_watch_enabled=false）：手工上传的账号文件需重启才生效")
+	case cfg.AuthWatchInterval > 0:
+		log.Printf("auths 目录热加载：每 %s 扫描 %s（手工上传/删除账号文件免重启）", cfg.AuthWatchInterval, cfg.AuthDir)
+	}
+	switch {
+	case !cfg.Schedule.CooldownProbeEnabled:
+		log.Printf("冷却探活已禁用（schedule.cooldown_probe_enabled=false）：到期的软冷却只能等自然到期或手动解冻")
+	case cfg.CooldownProbeInterval > 0:
+		log.Printf("冷却探活：每 %s 试探已到期的软冷却（成功即解冻，失败零惩罚；硬冷却不探）", cfg.CooldownProbeInterval)
+	}
+	if cfg.Schedule.IncludeDisabledInTasks {
+		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
+	}
+
+	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
+	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
+	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	live := livecfg.New(livecfg.Snapshot{
+		APIKey:               cfg.APIKey,
+		SoftCooldown:         cfg.SoftRateDur,
+		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		DeepseekSGFallback:   cfg.Pool.DeepseekSGFallback,
+		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+	})
+	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
+	// datapath 由 state 文件路径推出，避免再加一个配置项。
+	usagePath := usagePathFor(cfg.StateFile)
+	rec := usage.New(usagePath)
+	p.SeedDailyTokens(time.Now(), rec.DailyAccountTokens(time.Now()))
+	rec.Start()
+	defer rec.Stop()
+	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
+
+	// chatHandler 前置声明：panel 的 SaveConfig 闭包要拿到 handler 以热应用
+	// server.max_body_mb，而 handler 的 Config.Panel 又依赖 pn——装配循环用
+	// 变量前置 + saveConfig 内 nil 保护解开（SaveConfig 只在请求期被调，彼时
+	// handler 必已就位）。
+	var chatHandler *server.Handler
+	// 对外展示口径（隐藏名单 + 写死内置条目）：panel 与 handler 共用同一份，
+	// 避免"面板看得见、客户端调不到"的两处投影漂移。
+	hiddenModels := upstream.ResolveHiddenModels(cfg.Models.HiddenModels)
+	pinnedModels := upstream.ResolvePinnedModels(cfg.Models.PinnedModels)
+	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
+	requestLog := reqlog.New(reqlog.Config{
+		Dir:           stateSibling(cfg.StateFile, "request-logs"),
+		Enabled:       cfg.Logging.RequestArchiveEnabled,
+		RetentionDays: cfg.Logging.RequestRetentionDays,
+		MaxBytes:      int64(cfg.Logging.RequestArchiveMaxMB) << 20,
+	})
+	defer requestLog.Close()
+	rs := requestLog.Snapshot().Archive
+	if rs.Enabled {
+		log.Printf("[reqlog] 请求指标已启用；JSONL 归档 %s（保留 %d 天，上限 %d MiB）",
+			rs.Dir, cfg.Logging.RequestRetentionDays, cfg.Logging.RequestArchiveMaxMB)
+	} else {
+		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
+	}
+
+	pn := panel.New(panel.Config{
+		Pool:        p,
+		Usage:       rec,
+		RequestLog:  requestLog,
+		Upstream:    up,
+		Scheduler:   sch,
+		AuthDir:     cfg.AuthDir,
+		APIKey:      cfg.APIKey,
+		RedisMode:   redisMode,
+		StickyCount: sessCount,
+		Version:     appVersion,
+		Live:        live,
+		// 隐藏名单 / 写死条目与 handler 共用同一份（面板看得见的模型，客户端一定调得到）。
+		HiddenModels: hiddenModels,
+		PinnedModels: pinnedModels,
+		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
+		// 与 state 文件同目录，缺省 data/output_probes.json。
+		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
+		ConfigPath: *cfgPath,
+		LoadConfig: func() (any, error) {
+			return Load(*cfgPath)
+		},
+		SaveConfig: func(raw []byte) ([]string, error) {
+			return saveConfig(raw, *cfgPath, live, p, up, sch, chatHandler, sessRouter)
+		},
+	})
+	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
+	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
+	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
+	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
+	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+
+	h := server.NewHandler(server.Config{
+		Pool:             p,
+		Upstream:         up,
+		APIKey:           cfg.APIKey,
+		Session:          sessRouter,
+		StickyCount:      sessCount,
+		RedisMode:        redisMode,
+		SoftCooldown:     cfg.SoftRateDur,
+		Panel:            pn,
+		Live:             live,
+		Usage:            rec,
+		RequestLog:       requestLog,
+		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		PromptMode:       cfg.Prompt.Mode,
+		PromptText:       cfg.PromptText,
+		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global 模型名。
+		GlobalEnabled: cfg.Global.Enabled,
+		// 对外模型名协议：缺省去域前缀（单域部署不再出现 "global:"/"cn:"）。
+		// 显式前缀在入站方向仍被解析，老客户端配置不受影响。
+		StripRealmPrefix: cfg.Models.StripRealmPrefix,
+		RealmPrecedence:  cfg.Models.RealmPrecedence,
+		HiddenModels:     hiddenModels,
+		PinnedModels:     pinnedModels,
+		MaxBodyBytes:     int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		MaxRotate:        cfg.Server.MaxRotate,              // 单请求最多换号次数（池内账号多时可调大）
+		// 入站读窗口：handler 侧按此值逐请求重设读截止（面板改完即时生效）。
+		ReadTimeout: time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
+		// 11115 下调 max_tokens 重试开关（features.ptl_max_tokens_retry，默认 true）：
+		// 传指针以区分「未配置（默认开）」与「显式 false」；面板保存后经
+		// SetPTLMaxTokensRetry 热生效。
+		PTLMaxTokensRetry: boolPtr(cfg.Features.PTLMaxTokensRetry),
+	})
+	chatHandler = h
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go sch.Run(ctx)
+	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// auths 目录热加载：每 AuthWatchInterval 扫一轮，把手工上传/删除的 auth 文件对齐进池。
+	// 与启动时的 p.SyncToDir 共用 pool 的对账实现（语义逐字一致）。
+	// 注：即便 enabled=false 也调用（interval=0 → 循环空转等热启用），面板打开开关即生效。
+	sch.StartAuthWatch(ctx, cfg.AuthDir, cfg.AuthWatchInterval)
+	// 后台冷却探活：每 CooldownProbeInterval 把「已到期的软冷却」试探一遍，成功即解冻。
+	// 与 authwatch 同一形态：即便 enabled=false 也调用（interval=0 → 空转等热启用）。
+	sch.StartCooldownProbe(ctx, cfg.CooldownProbeInterval)
+
+	// 启动即预热模型目录缓存（保留积分 pool.reserve_credits 的"免费判定"数据源）。
+	//
+	// 为什么必须有：免费判定读的是两个**只读目录快照**（CN 侧 cachedCatalogSnapshot、
+	// global 侧 GlobalModelInfosStaleSnapshot——两者都"陈旧容错"，即超 TTL 后仍按最近
+	// 一次成功目录作答），而快照本身只在懒触发路径上填充（/v1/models、面板「模型与档位」）。
+	// 重启后到首次触发之间的空窗期里快照**从未成功过**（nil，没有"最近一次成功目录"可
+	// 回落）→ 判定按既有契约「缺失 ≠ 免费」答"非免费" → 余额触底的号把免费模型一并拦掉
+	// （只剩内置白名单那三个），正是本功能要修的病灶。上游对同一问题的实测（a4557dc）：
+	// "重启后 2 分钟，97 分的账号打收费模型归零；倍率表当时尚未建立"。
+	//
+	// 异步：不阻塞监听启动；单域失败只记 WARN（后续懒触发仍会补上，非致命）；
+	// ctx 取消（SIGINT/SIGTERM）时放弃剩余域，不拖住进程退出。
+	go server.WarmModelCatalog(ctx, up, p)
+
+	srv := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           h,
+		ReadHeaderTimeout: 30 * time.Second,
+		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
+		// 取值来自 server.read_timeout_seconds（默认 300s）：旧版写死 60s，让 8MB 上限
+		// 的请求必须在 60s 内传完（>1.1Mbps 稳定上行），而 460KB+ 上下文经 TUN 代理 +
+		// 跨境链路的上传耗时波动极大——超时即 i/o timeout，用户对话被拦腰截断
+		// （v1.9.13 生产事故）。300s 下 8MB 只需 27KB/s 上行。
+		// 注：请求体已默认无网关侧上限（max_body_mb 默认 0 = 不预拦截，吸收上游
+		// 73fe1f8）——本项现在是**唯一**的大 body 闸门，慢链路用户应显式调大它；
+		// 若显式开了 max_body_mb 护栏，本项取值要大于该体积在常规带宽下的上传耗时。
+		// 这里的值是**启动兜底**：面板改该项后由 handler 逐请求重设读截止即时生效
+		// （见 handler.armBodyReadDeadline），无需重启；本字段仍保留，覆盖 handler
+		// 未挂到的路径（如面板自身端点）并作为「连接建立 → 首个请求」的初值。
+		ReadTimeout: time.Duration(cfg.Server.ReadTimeoutSeconds) * time.Second,
+		// IdleTimeout keep-alive 空闲连接回收：配合 chat 出站 ctx 传播防连接泄漏堆积。
+		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
+		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
+		IdleTimeout: 120 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		p.Flush() // 信号触发：先落盘再做优雅停机
+		// Flush 已把最后一笔状态快照提交给 Redis（fire-and-forget）；store.Close
+		// 等 Upstash 在途/排队写排空再关连接——最后一笔镜像必须写完才退出（发现 4）。
+		// Noop 的 Close 是空操作；单写上限 5s × 上限 8，Close 内部另有 10s 超时兜底。
+		if cErr := store.Close(); cErr != nil {
+			log.Printf("WARN: [server] redisstore close: %v", cErr)
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	// 启动握手：先 bind、成功后才宣告 listening（见 startupListen 注释）。
+	// bind 失败时 startupListen 已打印可读诊断（含端口占用排查建议），这里直接退出。
+	ln, err := startupListen(cfg)
+	if err != nil {
+		os.Exit(1)
+	}
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("http: %v", err)
+	}
+	log.Printf("bye")
+}
+
+// startupListen 启动握手：先 bind（net.Listen），**成功后才**打 "listening on ..." 日志，
+// 返回可直接交给 srv.Serve 的 listener；bind 失败时打印可读诊断并返回该错误。
+//
+// 为什么先 bind 后打日志：旧实现先打 "listening on ..." 再 ListenAndServe，端口被占时
+// 日志自相矛盾——先宣称「正在监听」、紧接着 Fatal 退出，且错误只有裸 Go 错误串
+// （Windows 上是 "listen tcp :7863: bind: Only one usage of each socket address
+// (protocol/network address/port) is normally permitted."），既没有「端口被占用」这个
+// 结论，也没有下一步该敲什么命令；脚本侧（start-wb2api.cmd 的 2 秒存活自检）只能笼统
+// 提示「端口已被占用 / 配置非法 / 目录不可写」三种可能，用户仍需自己猜。
+//
+// 与 srv.ListenAndServe() 的等价性：标准库 ListenAndServe 本身就是
+// net.Listen("tcp", s.Addr) + s.Serve(ln) 两步（见 net/http/server.go），这里只是把它们
+// 拆开，让「bind 成功」与「宣告 listening」的先后可控。Serve 的错误语义与旧路径逐字一致
+// ——正常关闭（含 srv.Shutdown 触发的优雅停机）同样返回 http.ErrServerClosed，故 main 里
+// `err != http.ErrServerClosed` 的判断与优雅停机路径均不需改动。
+func startupListen(cfg *Config) (net.Listener, error) {
+	addr := listenAddr(cfg.Listen)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		for _, line := range bindFailLines(addr, err) {
+			log.Print(line)
+		}
+		return nil, err
+	}
+	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	// 入站读窗口透出：慢链路上传大上下文被掐断时，这一行是排查起点
+	// （server.read_timeout_seconds，面板可热改）。
+	log.Printf("[server] 入站请求体读取窗口 %ds（server.read_timeout_seconds，面板修改即时生效）；请求头上限 30s；请求体上限 %s",
+		cfg.Server.ReadTimeoutSeconds, bodyLimitDesc(cfg.Server.MaxBodyMB))
+	return ln, nil
+}
+
+// listenAddr 返回实际用于 bind 的地址，逐字对齐标准库的空地址回落：
+// net/http 的 ListenAndServe 在 s.Addr == "" 时改用 ":http"（即 80 端口）。
+// 正常路径下 cfg.Listen 非空（config.normalize 会把裸端口补成 ":7863"，Default() 给
+// ":7863"），此分支是为「把 ListenAndServe 拆成两步」不引入任何行为差异而保留，
+// 不依赖调用方的不变量。
+func listenAddr(listen string) string {
+	if listen == "" {
+		return ":http"
+	}
+	return listen
+}
+
+// wsaEADDRINUSE Windows Winsock「地址已在使用」错误码（10048）。
+//
+// 为何要单独写一个常量：Go 的 syscall.EADDRINUSE 在 Windows 上是 APPLICATION_ERROR
+// 域的伪 errno（实测值 536870914 = 0x20000002），而 Winsock 实际返回的是 10048，
+// 二者不相等——实测 errors.Is(bindErr, syscall.EADDRINUSE) 在 Windows 上恒为 false。
+// 只认 syscall.EADDRINUSE 会让 Windows 上的「端口被占用」全部落进未知错误分支，
+// 友好提示形同虚设。数值取自 Winsock 官方常量，非 Windows 平台 errno 均 < 200，
+// 不会误命中。
+const wsaEADDRINUSE = 10048
+
+// isAddrInUse 判定 bind 失败是否由「地址/端口已被占用」引起（跨平台）。
+// Unix（Linux/macOS 容器部署）走 syscall.EADDRINUSE；Windows 比对 Winsock 10048。
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return int(errno) == wsaEADDRINUSE
+	}
+	return false
+}
+
+// bindFailLines 把 bind 失败翻译成可读诊断（逐行返回，调用方逐行 log）。
+// 结论与「下一步敲什么」在前，原始 Go 错误串只作末行补充，不再是唯一信息。
+func bindFailLines(listen string, err error) []string {
+	port := listenPort(listen)
+	lines := []string{fmt.Sprintf("[server] 启动失败：无法监听 %s，本服务未启动。", listen)}
+	if isAddrInUse(err) {
+		lines = append(lines,
+			"        原因：该端口已被其它程序占用（bind 被系统拒绝）。",
+		)
+		if port != "" {
+			lines = append(lines, fmt.Sprintf("        排查：netstat -ano | findstr :%s（末列 PID 可在任务管理器对照进程名）", port))
+		} else {
+			lines = append(lines, "        排查：netstat -ano 找到占用该端口的 PID，再在任务管理器对照进程名")
+		}
+		lines = append(lines,
+			fmt.Sprintf("        处理：1) 结束占用该端口的程序后重试；2) 或改用其它端口——把 config.json 的 \"listen\" 改为 %q，", ":"+nextPort(port)),
+			"              或设环境变量 WB2A_LISTEN=:新端口（env 优先级高于 config.json）；",
+			"        提示：若本服务其实已在运行（重复启动），跑 status-wb2api.cmd 查看即可，无需再启一份；",
+			"              /healthz 响应体的 service 字段可确认该端口上是否为 workbuddy2api。",
+		)
+	} else {
+		lines = append(lines,
+			"        原因：监听地址不可用（非端口占用，多为 listen 配置写法有误）。",
+			"        处理：确认 config.json 的 \"listen\" 形如 \":7863\"（主机可省略、端口 1-65535），改后重试。",
+		)
+	}
+	return append(lines, fmt.Sprintf("        原始错误：%v", err))
+}
+
+// nextPort 返回「当前端口 +1」的字符串，供占用提示给出可直接照抄的替代端口；
+// port 为空或不可解析时返回 "7864"（默认端口 7863 的下一个，与上游 launcher 同款做法）。
+func nextPort(port string) string {
+	if n, err := strconv.Atoi(port); err == nil && n > 0 && n < 65535 {
+		return strconv.Itoa(n + 1)
+	}
+	return "7864"
+}
+
+// listenPort 从 listen 地址提取纯端口数字（":7863" / "0.0.0.0:7863" / "127.0.0.1:7863"
+// → "7863"），供 netstat 提示拼接；无法解析（空串、非数字端口）时返回空串，
+// 调用方据此退回不带端口的通用提示。
+func listenPort(listen string) string {
+	p := strings.TrimPrefix(panelListenPath(listen), ":")
+	if p == "" {
+		return ""
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < '0' || p[i] > '9' {
+			return ""
+		}
+	}
+	return p
+}
+
+// bodyLimitDesc 启动日志里的请求体上限描述（吸收上游 73fe1f8 后的口径）：
+// 0 = 不预拦截（默认，大请求交上游自然响应）；>0 = 网关侧内存护栏 N MB。
+// 独立函数便于测试盯住"日志别再说成默认 32MB"这一易回退口径。
+func bodyLimitDesc(maxBodyMB int) string {
+	if maxBodyMB <= 0 {
+		return "不预拦截（server.max_body_mb=0，交上游自然响应）"
+	}
+	return fmt.Sprintf("%dMB 网关内存护栏", maxBodyMB)
+}
+
+// panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
+// （":7863" 或 "0.0.0.0:7863" → ":7863"；异常输入原样返回）。
+func panelListenPath(listen string) string {
+	for i := len(listen) - 1; i >= 0; i-- {
+		if listen[i] == ':' {
+			return listen[i:]
+		}
+	}
+	return listen
+}
+
+// saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
+//
+// 热生效范围（设计取舍）：
+//   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
+//   - pool.* → pool.SetBreaker/SetDegrade/SetMaxInFlight/SetMaxInFlightGlobal/SetSoftRateMax/SetWeights/SetPickMode/SetReserveCredits
+//     （pool.pick_mode 另需 session.Router.SetSequential：粘性侧的新会话分配是**另一条**
+//     分配路径，见函数内注释）
+//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetAuthWatchInterval/SetCooldownProbeInterval
+//   - session_sticky.ttl → session.Router.SetTTL（原子热改；gc_interval 不在此列，
+//     GC ticker 已在 StartGC 时按旧值启动，重建风险大 → 仍列为重启项）
+//   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
+//   - server.max_rotate → handler.SetMaxRotate（同上一行口径：池内账号多时调大换号次数即时生效）
+//   - server.read_timeout_seconds → handler.SetReadTimeout（逐请求重设读截止，见
+//     handler.armBodyReadDeadline；慢链路大上下文不再被启动时的静态值掐断）
+//
+// 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
+//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.gc_interval
+//
+// 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
+// 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
+// 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, srv *server.Handler, sess *session.Router) ([]string, error) {
+	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
+	oldRaw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read current config: %w", err)
+	}
+	var cur, incoming map[string]any
+	if err := json.Unmarshal(oldRaw, &cur); err != nil {
+		cur = map[string]any{}
+	}
+	if err := json.Unmarshal(raw, &incoming); err != nil {
+		return nil, fmt.Errorf("parse submitted config: %w", err)
+	}
+	merged := mergeConfigMaps(cur, incoming)
+
+	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
+	newCfg, err := ParseConfig(mergedJSON(merged))
+	if err != nil {
+		return nil, err
+	}
+
+	// 3) 落盘（原子替换）。
+	out, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("replace config: %w", err)
+	}
+
+	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	live.Store(livecfg.Snapshot{
+		APIKey:               newCfg.APIKey,
+		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		SoftCooldown:         newCfg.SoftRateDur,
+		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		DeepseekSGFallback:   newCfg.Pool.DeepseekSGFallback,
+	})
+	// 脱敏开关热改走 atomic setter：本函数在**请求 goroutine**（面板 POST /panel/api/config）
+	// 内执行，与并发的在途请求（prepareBody 读开关）分属不同 goroutine，裸字段赋值是
+	// 数据竞争（-race 实证）。zeroWidth 面板勾选后即时生效，无需重启。
+	up.SetSanitizeFingerprints(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.SetZeroWidthSanitize(newCfg.Features.ZeroWidthSanitize)
+	// 历史推理裁剪档位同为热改项（features.reasoning_history）：下一次出站请求即按新档
+	// 组装 body，无需重启；已发出的请求不受影响（不追溯改写在途 body）。
+	up.SetReasoningHistory(newCfg.Features.ReasoningHistory)
+	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
+	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
+	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal) // global 域在途分档（面板改完即时生效）
+	// 连败降权三键热改（issue #114）：阈值/时长/封顶立即生效——下一次 NoteFailures
+	// 即按新阈值判定、下一次达阈按新时长降权。已在降权期的账号保持原截止不追溯
+	// 重算（与熔断参数热改同口径：不回溯改写既有惩罚）。
+	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
+	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
+	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
+	// 选号模式热改（pool.pick_mode）：原子写，**下一次选号**即按新模式（已发出的请求
+	// 不追溯改选号口径）。池内顺序（account_order）不在此处：它由面板拖拽端点
+	// POST /panel/api/accounts/order 直接写池并落盘，与 config 无关。
+	//
+	// 两处都要热改（同一模式的**两条分配路径**，缺一即"改了配置但一半流量照旧"）：
+	//   - pool.SetPickMode：无会话键的请求走 Pool.Pick 的 healthy 段挑选；
+	//   - sess.SetSequential：带会话键的**新会话分配**（session.Router.assign）。
+	//     粘性命中路径不受影响（已绑定的会话继续粘着，与模式无关）。
+	// sess 为 nil 表示粘性关闭（session_sticky.enabled=false，main 未建 Router）——
+	// 跳过热应用即可（此时本就没有粘性分配路径）。
+	p.SetPickMode(PickMode(newCfg.Pool.PickMode))
+	if sess != nil {
+		sess.SetSequential(PickMode(newCfg.Pool.PickMode) == pool.PickSequential)
+	}
+	// 保留积分线热改（pool.reserve_credits）：原子写，**下一次选号**即按新值判定
+	// （已发出的请求不追溯改选号口径，与 pick_mode 同款）。设为 0 = 立即关闭该闸门，
+	// 行为回到改动前。判定回调（免费模型集合）不在此处重装：它读的是目录**只读快照**，
+	// 每次调用现算，配置改动与目录刷新都会自然反映（见 server.FreeModelLookup）。
+	p.SetReserveCredits(int64(newCfg.Pool.ReserveCredits))
+	sch.Reconfigure(
+		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
+		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
+		newCfg.Schedule.GrowthHours,
+		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
+		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
+		!newCfg.Schedule.GrowthEnabled)
+	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	// auths 目录热加载间隔/开关热改：原子写 + rearm（下一轮生效，无需重启）。
+	// 注意 auth_dir 本身仍是重启项（watcher 在启动时捕获目录），热改只影响扫描节奏。
+	sch.SetAuthWatchInterval(newCfg.AuthWatchInterval)
+	// 后台冷却探活间隔/开关热改：原子写 + rearm（下一轮生效，无需重启）。
+	sch.SetCooldownProbeInterval(newCfg.CooldownProbeInterval)
+	// 快过期积分窗口热改：原子写，下一轮签到/余额刷新即按新窗口分桶（无需重启）。
+	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
+	// 粘性 TTL 热改：原子写，下一次 expired 判定（快路径/慢路径/GC）即按新值算。
+	// sess 为 nil 表示粘性关闭（session_sticky.enabled=false，main 未建 Router）——
+	// 跳过热应用即可，落盘的 TTL 在下次开启粘性并重启后生效。
+	if sess != nil {
+		sess.SetTTL(newCfg.SessionTTL)
+	}
+	// srv 为 nil 仅出现在装配未完成的窗口（SaveConfig 只在请求期被调，理论不可达），
+	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
+	if srv != nil {
+		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
+		srv.SetMaxRotate(newCfg.Server.MaxRotate) // 池内账号多时调大换号次数，保存后即时生效
+		// 11115 下调 max_tokens 重试开关热改（features.ptl_max_tokens_retry）：写原子
+		// 镜像，下一个请求即按新值判定，无需重启（与 sanitize_fingerprints 同口径）。
+		srv.SetPTLMaxTokensRetry(newCfg.Features.PTLMaxTokensRetry)
+		// 入站读窗口热改：handler 侧只写原子镜像，实际生效靠逐请求重设读截止
+		// （armBodyReadDeadline）。刻意不改 http.Server.ReadTimeout——它是裸字段、
+		// 无并发安全 setter，运行期赋值是数据竞争；且启动时那份静态值仅作兜底。
+		srv.SetReadTimeout(time.Duration(newCfg.Server.ReadTimeoutSeconds) * time.Second)
+	}
+	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+
+	return restartRequiredFields(newCfg), nil
+}
+
+// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
+// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
+func restartRequiredFields(c *Config) []string {
+	var out []string
+	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
+	if c.Listen != "" {
+		out = append(out, "listen")
+	}
+	if c.AuthDir != "" {
+		out = append(out, "auth_dir")
+	}
+	if c.StateFile != "" {
+		out = append(out, "state_file")
+	}
+	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
+	// 连接层四项同样是装配期依赖：Transport 在启动时按配置构造一次（见 main 的
+	// ConfigureTransport 调用），HTTP 与 ChatHTTP 共享该实例；运行期重建会换掉
+	// 在途请求脚下的 Transport，刻意不做热改。
+	out = append(out, "upstream.disable_http2", "upstream.tls_handshake_timeout_seconds",
+		"upstream.dial_timeout_seconds", "upstream.idle_conn_timeout_seconds")
+	// upstream.user_agent 在装配期被写进出站 client（main.go 的 up.UserAgent = ...），
+	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
+	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
+	out = append(out, "upstream.user_agent")
+	if c.Upstash.URL != "" || c.Upstash.Token != "" {
+		out = append(out, "upstash")
+	}
+	// session_sticky.ttl 已从本清单移除：它现在经 Router.SetTTL 原子热生效。
+	// gc_interval 保留：GC ticker 在 StartGC 时按当时值建立，热改需重建 goroutine
+	// （StopGC+StartGC 与在途 tick 有竞态），刻意不做，仍按重启项提示。
+	out = append(out, "session_sticky.gc_interval")
+	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
+	return out
+}
+
+// mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。
+// 对嵌套对象逐键覆盖而不是整体替换：面板表单只提交它管理的键，
+// 未提交的兄弟键（含用户手写的未知键）保持原样。
+func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
+	for k, v := range incoming {
+		if inMap, ok := v.(map[string]any); ok {
+			if curMap, ok := cur[k].(map[string]any); ok {
+				cur[k] = mergeConfigMaps(curMap, inMap)
+				continue
+			}
+		}
+		cur[k] = v
+	}
+	return cur
+}
+
+// mergedJSON 把合并后的 map 序列化回 JSON（供 ParseConfig 校验）。
+func mergedJSON(m map[string]any) []byte {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}

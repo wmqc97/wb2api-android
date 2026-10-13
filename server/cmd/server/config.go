@@ -1,0 +1,1028 @@
+// config.go 加载 JSON 配置 + 环境变量覆盖。
+package main
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+)
+
+// Config 顶层配置。
+type Config struct {
+	Listen    string `json:"listen"`     // ":7863"
+	APIKey    string `json:"api_key"`    // 空 = 不鉴权
+	AuthDir   string `json:"auth_dir"`   // ./auths
+	StateFile string `json:"state_file"` // ./data/state.json
+
+	Server struct {
+		// MaxBodyMB 聊天请求体大小上限（单位 MB，**默认 0 = 不预拦截**，吸收上游 73fe1f8）。
+		//
+		// 语义：
+		//   - 0（默认）→ 网关**不做**任何请求体预拦截，完整读入后交上游自然响应。
+		//     上游的错误响应信息量更大（能看到上游到底是什么策略），网关提前 413
+		//     反而挡住上游真实行为；多图/长上下文会话（历史图片每轮 base64 重发）
+		//     不再撞网关上限。
+		//   - >0 → 保留一道**网关侧内存护栏**（不是上游限制）：超限直接 413
+		//     request_body_too_large，不把半截请求喂上游（issue #41：截断的 JSON 让
+		//     上游 unmarshal 报 unexpected EOF，网关却罚号）。无入站并发闸门时实测
+		//     单请求峰值内存约为 body 的 5 倍——大内存机器上想开护栏时按此估算。
+		//
+		// 为什么保留该键而不是像上游那样直接删（本仓刻意的取舍）：删键会让既有
+		// config.json 里的显式设置静默失效（未知键被忽略），正是 issue #17 反复
+		// 强调的"改了配置却不生效还不提示"失效模式；保留可显式开启的护栏也更安全。
+		// 负数视为非法 → normalize fail fast（负的字节上限没有合理语义）。
+		MaxBodyMB int `json:"max_body_mb"`
+
+		// MaxRotate 单请求最多换号次数（默认 3）。
+		// 池内账号多时（如 4-8 个）默认 3 次试不满所有号，调大可让单请求覆盖更多账号。
+		// 0/负数 normalize 回落默认 3（与 max_body_mb 的 fail fast 不同：此键的 0
+		// 没有"不限"之类的合理语义，无从误导用户，回落默认更友好）。
+		MaxRotate int `json:"max_rotate"`
+
+		// ReadTimeoutSeconds 入站请求体读取窗口（秒，默认 300）。
+		//
+		// 语义：从「请求开始读」到「body 读完」的整段窗口上限，对应 http.Server 的
+		// ReadTimeout。它不是"首字节超时"（那是 ReadHeaderTimeout，固定 30s，头很小
+		// 不受本项影响），也不是出站超时（那些在 upstream 段）。
+		//
+		// 为什么默认从写死的 60s 提到 300s（v1.9.13 生产事故）：旧值让 8MB 上限的请求
+		// 必须在 60s 内传完（>1.1Mbps 稳定上行），而 460KB+ 的聊天上下文经 TUN 代理 +
+		// 跨境链路时上传耗时波动极大——一旦超 60s，io.ReadAll 报 i/o timeout，用户
+		// 对话被拦腰截断（invalid_request）。300s 下 8MB 只需 27KB/s 上行，跨境链路
+		// 可满足，同时远小于慢速攻击所需的时间尺度（ReadHeaderTimeout=30s 仍是慢速
+		// 头的有效闸门）。
+		//
+		// 与 max_body_mb 默认提到 32MB（v1.9.17）的关系：同窗口下 32MB 需要约
+		// 109KB/s 稳定上行，跨境慢链路未必给得出——慢链路用户应同步调大本项，
+		// 否则大 body 会在传完之前被读窗口掐断（表现为 invalid_request 而非 413）。
+		//
+		// 0/负数回落默认 300（与 max_rotate 同风格）。注意这里**刻意不采用**
+		// http.Server 的「0 = 不限」语义：0 在配置文件里更可能被当成"没填/用默认"，
+		// 而"不限"等于拆掉慢速 body 的闸门，与旧值 60s 的防护意图相悖；要放宽就显式
+		// 给个大值（如 900），别靠 0 猜。面板修改后经 handler.SetReadTimeout 逐请求
+		// 即时生效，无需重启（见 handler.armBodyReadDeadline）。
+		ReadTimeoutSeconds int `json:"read_timeout_seconds"`
+	} `json:"server"`
+
+	Logging struct {
+		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
+		RequestArchiveEnabled bool `json:"request_archive_enabled"`
+		// RequestRetentionDays 归档保留天数，缺省 7；<=0 回落默认。
+		RequestRetentionDays int `json:"request_retention_days"`
+		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
+		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+		// RequestClientInfo 是否在请求日志（归档事件 + stdout 流水行 + 面板运行
+		// 日志）里记录调用来源：客户端 IP 与 User-Agent。缺省 true。
+		//
+		// 为什么做成开关而不是恒开：来源信息是排查"谁在打网关"的第一手线索，
+		// 但它比 token 计数敏感（IP 属个人信息），共享部署/多租户场景可能需要
+		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
+		// 热生效（经 livecfg 快照），无需重启。
+		RequestClientInfo bool `json:"request_client_info"`
+	} `json:"logging"`
+
+	Cooldown struct {
+		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
+		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
+		// 旧 config 中的这些键因 JSON 未知字段而自然忽略，不报错。
+		SoftRate string `json:"soft_rate"` // "600s"，软限流冷却基数
+		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
+		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
+		SoftRateMax string `json:"soft_rate_max"` // "2h"
+	} `json:"cooldown"`
+
+	Schedule struct {
+		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
+		TravelHours    []int `json:"travel_hours"`    // [9,21]
+		ActivityHours  []int `json:"activity_hours"`  // [10]
+		KeepaliveHours []int `json:"keepalive_hours"` // [22]
+		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
+		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
+		//
+		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
+		//   - 空数组与 null 在老语义里已被"未配置 → 回落默认"占用，改判会静默翻转
+		//     所有老 config 的行为（用户只想删掉一行，结果关掉了签到）；bool 缺省 true
+		//     则对老配置零影响，向后完全兼容。
+		//   - 开关与取值解耦：禁用时仍保留用户显式配的小时，重新启用无需补配。
+		//   - 无需猜测哨兵（[-1] 之类），非法小时一律报错并提示改用本开关。
+		// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
+		CheckinEnabled   bool `json:"checkin_enabled"`   // 缺省 true；false = 关签到
+		TravelEnabled    bool `json:"travel_enabled"`    // 缺省 true；false = 完全停猫猫旅行
+		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
+		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
+		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
+
+		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
+		// 余额刷新）对**已禁用（disabled）**的账号也执行。
+		//
+		// 为什么需要它：面板「禁用」的语义是「不再参与选号」（见面板确认文案），但这四类
+		// 任务此前一律 `if st.Disabled { continue }`，等于把「停用流量」放大成「停止一切
+		// 上游保号行为」——被禁用的号拿不到签到积分、不续 token、余额也不再刷新；而
+		// ReenableIfCredits 明确不复活 disabled 账号（见 pool.state.go），于是签到这条唯一
+		// 的自动回血路径也断了，账号只能靠人工「解冻」回来。
+		//
+		// 对「一次只放开一个号、用禁用做流量开关」的轮换用法（同 IP 多号防风控），闲置
+		// 待命的号恰恰是最需要签到的那批——本开关即为该用法提供出口。
+		//
+		// 缺省 false = 保持既有行为，对老配置零影响。打开后禁用号仍会签到 / 保活，但
+		// **依旧不参与选号**：pool 选号侧的 disabled 过滤不受本开关影响。
+		IncludeDisabledInTasks bool `json:"include_disabled_in_tasks"`
+
+		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
+		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
+		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
+		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+
+		// auths 目录热加载：定时扫描 auth_dir，把手工上传/删除的 auth 文件增量对齐进池，
+		// 免重启生效（云服务器场景：本地登录后把凭证文件上传到 auths/）。缺省开启。
+		AuthWatchEnabled bool `json:"auth_watch_enabled"` // 缺省 true；false = 关闭
+		AuthWatchSeconds int  `json:"auth_watch_seconds"` // 缺省 30；<=0 回落 30
+
+		// 后台冷却探活：定时把「已到期的软冷却」（账号级 CoolSoft 到期 / 模型级
+		// modelCooldowns 条目到期）拿出来各发一个最小 chat 请求，试探上游是否已提前
+		// 恢复——上游重置文案保守（或提前放量）时，网关不必干等声明的墙钟。
+		// 成功即解冻（模型级条目提前失效；账号级软冷却一并清）；**失败零惩罚**
+		// （不推进 softStreak、不延长冷却、不喂熔断器——探活绝不能把账号越探越死）。
+		// 硬冷却（CoolHard：积分耗尽）绝不探（恢复条件是签到到账，探了白花配额）。
+		// 缺省开启（用户痛点：单账号部署撞 6004 后整站 503 且无从试探）。
+		CooldownProbeEnabled bool `json:"cooldown_probe_enabled"` // 缺省 true；false = 关闭
+		CooldownProbeMinutes int  `json:"cooldown_probe_minutes"` // 缺省 10；<=0 回落 10
+	} `json:"schedule"`
+
+	Global struct {
+		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
+		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
+		// 显式 "enabled": false 关闭（逃生门，纯 CN 锁定：即便 auth 写了 realm=global
+		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
+		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
+		Enabled bool `json:"enabled"`
+		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
+		// https://www.workbuddy.ai（internal/upstream.defaultGlobalBase）。
+		ChatBase    string `json:"chat_base"`
+		BillingBase string `json:"billing_base"`
+	} `json:"global"`
+
+	Upstream struct {
+		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
+		TimeoutSeconds int `json:"timeout_seconds"`
+		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
+		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
+		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
+		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
+		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
+		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
+		UserAgent string `json:"user_agent"`
+		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
+		// X-IDE-Version）。空 = 内置默认（对齐官方 5.5.4 分发包）。
+		ClientVersion string `json:"client_version"`
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+		CliVersion string `json:"cli_version"`
+		// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
+		// 空 = 旧行为 X-Product="SaaS" 不设 X-IDE-*；配 "WorkBuddy" 则四头跟随。
+		ClientName string `json:"client_name"`
+		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底；空 = 不注入。
+		// 每号 auth 文件的 device_token 键优先于本项。
+		DeviceToken string `json:"device_token"`
+		// DeviceTokenFile device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
+		DeviceTokenFile string `json:"device_token_file"`
+		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
+		PassthroughIP bool `json:"passthrough_ip"`
+		// DisableHTTP2 是否禁用出站 HTTP/2（默认 **false = 启用 h2**）。
+		// 默认启用的依据（2026-09-18 CN 上游各 10 次实测）：走 TUN 代理
+		// （verge-mihomo）时链路握手长——允许 h2 为 HTTP/2.0、连接复用 90%、
+		// TLS 握手首次 1123ms 后续 92-98ms；禁 h2 为 HTTP/1.1 且 abort 模式下
+		// 复用率 0%（每请求重新握手）→ 频繁 TLS handshake timeout。
+		// 语义用「disable」而非「enable」：h2 是默认行为，本键只描述要不要关掉，
+		// 缺键（JSON 零值 false）天然落在「启用」一侧，漏配不会被静默降级。
+		// 显式 true = 逃生门（h2 半死流复用异常时退回 HTTP/1.1）。
+		DisableHTTP2 bool `json:"disable_http2"`
+		// TLSHandshakeTimeoutSeconds TLS 握手上限，默认 30（<=0 回落 30）。
+		// 10s 在国内网络过紧（实测常态 >10s 会误杀重试），30s 与 dial 取齐。
+		TLSHandshakeTimeoutSeconds int `json:"tls_handshake_timeout_seconds"`
+		// DialTimeoutSeconds TCP 建连上限，默认 30（<=0 回落 30）。半死连接的
+		// 第一道闸：连不上快速失败轮转换号，不干等系统 TCP 重传窗口。
+		DialTimeoutSeconds int `json:"dial_timeout_seconds"`
+		// IdleConnTimeoutSeconds 空闲连接池保留时长，默认 90（<=0 回落 90）。
+		// 从 30s 回退到 90s：30s 太激进（连接刚建好就过期，h2 下一条连接承载
+		// 全部流，被回收等于下个请求重新握手）；v1.9.6 用 90s 实测表现顺滑。
+		IdleConnTimeoutSeconds int `json:"idle_conn_timeout_seconds"`
+		// MachineIDHeaders 是否在业务出站路径（chat/billing/模型目录）注入按 uid 固定盐
+		// 派生的 X-Machine-ID / X-Session-ID（默认 true，与上游三仓默认一致）。
+		// false = 完全还原旧行为（仅 X-Device-Token，无设备标识）——不想带设备指纹的
+		// 部署逃生门。refresh/auth 类路径恒不注入（与开关无关）。改动需重启进程。
+		MachineIDHeaders bool `json:"machine_id_headers"`
+	} `json:"upstream"`
+
+	Features struct {
+		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
+		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ZeroWidthSanitize 零宽字符脱敏（默认 false）：在 system 消息的指纹词内部插入
+		// U+200B，可见文本不变、只破坏上游的逐字精确匹配。
+		// 与上面那个独立：上面是"改写/删除"（默认开、覆盖面窄），这里是"插入不可见字符"
+		// （默认关、覆盖面广）。两者叠加不冲突，开启顺序固定为先改写后插零宽。
+		ZeroWidthSanitize bool `json:"zerowidth_sanitize"`
+		// ReasoningHistory 出站历史推理文本裁剪档位（默认 "full"）：
+		//   "full"  — 全量保留推理原文（行为与加本键前逐字节一致）；
+		//   "last"  — 只保留最后一条带推理文本的 assistant 消息的原文，其余置单个空格；
+		//   "blank" — 所有 assistant 推理字段一律置单个空格（省 token 最多）。
+		//
+		// 为什么值得配（实测 2026-09-19，真实请求打 deepseek-v4.1-flash / global 域）：
+		// 上游只对「带 tool_calls 的 assistant 消息」计算推理文本 token——40000 字符的
+		// reasoning_content 让 prompt_tokens 从 346 涨到 9234，换成单个空格则回到 346；
+		// 而真实客户端（ZCode 3.11.2）给每条 assistant 挂完整推理文本，长会话里推理约占
+		// **总 token 的一半**（887 条消息实测 376 条带推理、合计 178 万字符），是用户撞上
+		// 1,048,576 上下文上限、被客户端强制压缩的主因。三档语义与占位口径见
+		// internal/upstream/reasoning_history.go。
+		//
+		// 非法值（空串/未知）回落 "full" 并记 warn（fail-safe，不改变既有行为）——
+		// 不像 prompt.mode 那样 fail fast：这是个默认关闭的性能开关，拼错一个词就让
+		// 网关起不来，代价远大于收益。
+		ReasoningHistory string `json:"reasoning_history"`
+		// PTLMaxTokensRetry 11115「prompt is too long」时按错误里的真实数字下调
+		// max_tokens 重试一次的开关（**默认 true**）。
+		//
+		// 为什么默认开是安全的：本项只在 11115 时生效，且**失败路径逐字退回首次的原始
+		// 上游错误**（客户端看到的报错与关掉本项时完全一致）——最坏情形只是多打一次
+		// 上游；能算就重试，算不出/不适用一律保持现状（不轮转账号、不记任何惩罚）。
+		//
+		// 假设的诚实说明：依据是实测「max_tokens=128000 + 约 95 万 token 输入 → 11115 报
+		// 1083265 > 1048576；同内容 max_tokens=20000 时被上游计为 955192，
+		// 1083265-955192=128073 ≈ max_tokens」，**强烈提示**上游把 max_tokens 也算进上下文
+		// 上限检查，但**未 100% 证实**（另有一次 max_tokens=1048576 + 极小输入返回 200，
+		// 说明要么不计入、要么 max_tokens 被截到模型上限后再判）。故本项定位是**安全兜底**
+		// 而非结论：真正的语义仍以上游原文为准（透传纪律不变）。
+		//
+		// 判定与下调规则见 internal/upstream/ptl_overshoot.go（含安全余量与下限理由）。
+		// 热生效：面板保存后经 server.Handler.SetPTLMaxTokensRetry 立即生效，无需重启。
+		PTLMaxTokensRetry bool `json:"ptl_max_tokens_retry"`
+	} `json:"features"`
+
+	Prompt struct {
+		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
+		// custom = 网关用自有系统提示词替换客户端 system/developer。
+		Mode string `json:"mode"` // "passthrough" / "custom"
+		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
+		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
+		File string `json:"file"`
+	} `json:"prompt"`
+
+	// PromptText 解析后的系统提示词文本（custom 模式使用）。
+	PromptText string `json:"-"`
+
+	Upstash struct {
+		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
+		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
+	} `json:"upstash"`
+
+	Pool struct {
+		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
+		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
+		// 并存取更长者不叠加，成功即回池。默认 5 次 / 10m（时长固定，不做指数退避）。
+		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
+		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
+		ExpiringSoon string `json:"expiring_soon"`
+		// PickMode 选号模式：
+		//   - "weighted"（缺省）：三因子加权随机（Top5 短名单 + 加权抽签），
+		//     即本键引入前的既有行为，逐字节不变；
+		//   - "sequential"：**顺序填充式**——按账号列表顺序（面板可拖动排序，
+		//     持久化在 state.json 顶层 account_order）从上到下取第一个合格账号。
+		//     某号在途占满（pool.max_in_flight / max_in_flight_global）时临时溢出给
+		//     下一个号，并发降回来后它重新成为首选（顺序靠前优先，不是轮转）；
+		//     收到带恢复时间的 429（applyErrorPolicy 的 ErrSoftRate 分支）时该号
+		//     冷却到恢复时刻、自然被跳过。用于解决「每次挑不同账号请求」引发的
+		//     频繁 429。
+		// 非法值（空/未知）回落 weighted 并记 warn——与 features.reasoning_history
+		// 同风格：本键的缺省方向必须与改动前逐字节一致（静默失败的方向是"保持旧行为"）。
+		PickMode string `json:"pick_mode"`
+
+		// ReserveCredits 保留积分线（**默认 50**）：账号余额 ≤ 本值时，它只对**免费/低价
+		// 模型**可用，贵模型请求跳过该号（换别的号）——用户需求原话「设置一个保留至少
+		// 积分，不然免费的 4.1 都用不了……贵模型把积分用到剩余 50 了就不能再用这个号，
+		// 只有免费模型才可以使用」。
+		//
+		// 免费/低价的判定是**模型感知**的（见 internal/pool/reserve.go 文件头）：
+		//   ① 倍率口径（主判据）：模型目录里的**生效倍率** ≤ 0（牌价 x0.00，或
+		//      modelPromotions 的 factor=0 限时免费）——数据源是 CN/global 两个目录
+		//      快照（server.FreeModelLookup），注入 pool.SetFreeModelLookup；
+		//   ② 兜底白名单：hy4-preview / hy3 / deepseek-v4.1-flash（用户点名要保的三个）。
+		// 两层取并集，理由见 pool/reserve.go。
+		//
+		// 0 = **关闭**（回到改动前行为：余额触底不产生任何过滤）。负值非法 → normalize
+		// fail fast——负的保留线没有合理语义，静默钳 0 会让"我配了个负数"变成"关掉了
+		// 这个功能"，正是 issue #17 反复强调的失效模式（与 server.max_body_mb 同风格）。
+		//
+		// 余额**未知**（credits_total 为 0，即从未刷新过余额）时闸门 fail-open：
+		// 不拿"未知"当"余额 0"，否则全新部署在首次余额刷新前会把付费模型全打成 503。
+		//
+		// 面板保存后经 pool.SetReserveCredits 热生效（下一次选号即按新值）。
+		ReserveCredits     int  `json:"reserve_credits"`
+		DeepseekSGFallback bool `json:"deepseek_sg_fallback"`
+	} `json:"pool"`
+
+	// Models 网关对外模型名协议（/v1/models 的 id 形态 + 裸名归属域）。
+	Models struct {
+		// StripRealmPrefix 缺省 true：/v1/models 输出裸模型名，不带 "cn:"/"global:" 前缀。
+		// 显式前缀在入站方向仍被解析（老客户端配置零改动）；显式 false 恢复历史行为。
+		StripRealmPrefix bool `json:"strip_realm_prefix"`
+		// RealmPrecedence 裸模型名在「池内两域都有账号」时的默认归属域：
+		// "global"（缺省）/ "cn"。单域部署（只登国际版账号）下此项无影响——
+		// 裸名直接落唯一可用域。
+		// 这是**软优先**而非硬规则：本域选不出可用账号时请求回落另一域，避免
+		// 混合池下"本域全限流即 503"（跨域发生时有 "pool: realm fallback" 日志）。
+		// 显式 "cn:"/"global:" 前缀是用户强指定，一律不回落，本域不可用即 503。
+		RealmPrecedence string `json:"realm_precedence"`
+		// HiddenModels 对外隐藏的模型名（面板「模型与档位」与 /v1/models 同口径）。
+		// 键缺席 → 用内置默认：上游的路由策略别名 default-model / fast-model /
+		// balanced-model / primary-model / deep-model（它们不是真实模型，选中后由
+		// 上游按当时策略转派，倍率与窗口随时变）。
+		// 显式 [] → 全部展示；非空数组 → 以该名单为准。
+		HiddenModels []string `json:"hidden_models"`
+		// PinnedModels 强制内置的模型条目：上游目录不给（账号差异/灰度）、但实际可调用
+		// 的模型，写死一份能力快照让它稳定出现在面板与 /v1/models。
+		// 键缺席 → 用内置默认（deepseek-v4.1-flash）；显式 [] → 不强行内置。
+		// 上游若开始返回同名模型，自动以上游数据为准（写死条目让位）。
+		PinnedModels []upstream.PinnedModel `json:"pinned_models"`
+	} `json:"models"`
+
+	SessionSticky struct {
+		Enabled    bool   `json:"enabled"`     // 默认 true
+		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
+		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+	} `json:"session_sticky"`
+
+	// 解析后
+	SoftRateDur            time.Duration `json:"-"`
+	SoftRateMaxDur         time.Duration `json:"-"`
+	BreakerCooldownDur     time.Duration `json:"-"`
+	BreakerCooldownMaxD    time.Duration `json:"-"`
+	DegradeCooldownDur     time.Duration `json:"-"`
+	DegradeCooldownMaxD    time.Duration `json:"-"`
+	SessionTTL             time.Duration `json:"-"`
+	SessionGCInterval      time.Duration `json:"-"`
+	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
+	AuthWatchInterval      time.Duration `json:"-"` // 0 = 不启动/暂停（enabled=false）
+	CooldownProbeInterval  time.Duration `json:"-"` // 0 = 暂停/未启用（enabled=false）
+	ExpiringSoonDur        time.Duration `json:"-"`
+}
+
+// Default 默认配置。
+func Default() *Config {
+	c := &Config{
+		Listen:    ":7863",
+		APIKey:    "",
+		AuthDir:   "./auths",
+		StateFile: "./data/state.json",
+	}
+	c.Cooldown.SoftRate = "600s"
+	c.Cooldown.SoftRateMax = "2h"
+	// 请求体上限默认 0 = **不预拦截**（吸收上游 73fe1f8，见字段注释）：大请求完整读入
+	// 后交上游自然响应，网关不再以 413 提前挡住上游真实行为。显式 >0 时仍是一道
+	// 网关侧内存护栏。
+	// 值取自 server.DefaultMaxBodyBytes（handler 侧同一常量），避免"配置默认一个数、
+	// handler 兜底另一个数"的静默漂移（与下面 ReadTimeoutSeconds 同一处理风格）。
+	c.Server.MaxBodyMB = int(server.DefaultMaxBodyBytes >> 20)
+	c.Server.MaxRotate = 3 // 单请求最多换号次数默认 3（与 handler 侧兜底口径一致）
+	// 入站 body 读取窗口默认 300s：8MB/5min 只需 27KB/s 上行，跨境慢链路可满足；
+	// 旧写死值 60s 是生产 503 事故根因（见字段注释）。
+	// 值取自 server.DefaultReadTimeout（handler 侧兜底同一常量），避免"配置默认一个数、
+	// handler 兜底另一个数"的静默漂移。
+	c.Server.ReadTimeoutSeconds = int(server.DefaultReadTimeout / time.Second)
+	c.Logging.RequestArchiveEnabled = true
+	c.Logging.RequestRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 100
+	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
+	// 只有显式 false 才关闭来源记录。
+	c.Logging.RequestClientInfo = true
+	c.Schedule.CheckinHours = []int{9, 21}
+	c.Schedule.TravelHours = []int{9, 21}
+	c.Schedule.ActivityHours = []int{10}
+	c.Schedule.KeepaliveHours = []int{22}
+	c.Schedule.BlackcatHours = []int{23}
+	c.Schedule.GrowthHours = []int{1}
+	// 模型名协议缺省：去域前缀（裸名）+ 裸名默认落 global。键缺席时 Default() 的值
+	// 被原样保留，只有显式配置才覆盖。
+	c.Models.StripRealmPrefix = true
+	c.Models.RealmPrecedence = "global"
+	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
+	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
+	c.Schedule.CheckinEnabled = true
+	c.Schedule.TravelEnabled = true
+	c.Schedule.ActivityEnabled = true
+	c.Schedule.KeepaliveEnabled = true
+	c.Schedule.BlackcatEnabled = true
+	c.Schedule.GrowthEnabled = true
+	c.Schedule.BalanceRefreshEnabled = true
+	c.Schedule.BalanceRefreshMinutes = 5
+	// auths 目录热加载缺省开启、30 秒一轮（账号数是个位数，每轮只做目录列表 + stat）。
+	c.Schedule.AuthWatchEnabled = true
+	c.Schedule.AuthWatchSeconds = 30
+	// 后台冷却探活缺省开启、10 分钟一轮：探活只在「有到期目标」时才发请求（无目标时
+	// 整轮零出站流量），故默认开启的边际成本仅是每 10 分钟一次池遍历。
+	c.Schedule.CooldownProbeEnabled = true
+	c.Schedule.CooldownProbeMinutes = 10
+	c.Upstream.TimeoutSeconds = 120
+	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
+	c.Upstream.HeaderTimeoutSeconds = 0
+	c.Upstream.IdleTimeoutSeconds = 0
+	// 连接层四项（h2 / 握手 / 拨号 / 空闲池）：h2 默认启用——DisableHTTP2 不在此
+	// 显式赋值，靠 bool 零值 false = 启用（语义见字段注释；反写成 enable 语义就会
+	// 出现「漏配一项即静默退回 HTTP/1.1」）；三个超时显式给推荐值，<=0 在
+	// normalize() 回落同一批值（幂等）。
+	c.Upstream.TLSHandshakeTimeoutSeconds = 30
+	c.Upstream.DialTimeoutSeconds = 30
+	c.Upstream.IdleConnTimeoutSeconds = 90
+	// MachineIDHeaders 缺省 true（同 Schedule 各开关的"缺省 true"手法：Load 先取
+	// Default() 再 json.Unmarshal 覆盖，键缺席/为 null 时保留 true，只有显式 false 才关）。
+	// 上游三仓默认就带 X-Machine-ID/X-Session-ID，缺省不带反而多一个"设备指纹缺失"特征。
+	c.Upstream.MachineIDHeaders = true
+	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
+	// ChatBase/BillingBase 缺省空（回落内置默认）。
+	c.Global.Enabled = true
+	c.Features.SanitizeBlacklistFingerprints = true
+	// 零宽脱敏默认关：它改动的是"看不见的字节"，出问题时表现为两个看起来一样的字符串对不上，
+	// 排查成本高。由使用者在面板显式开启（与上游 codebuddy2api 的默认关闭口径一致）。
+	c.Features.ZeroWidthSanitize = false
+	// 历史推理裁剪默认 full（零回归）：这是"改写出站历史"的开关，与上面两个脱敏开关
+	// 同类——默认必须与加本键前逐字节一致，由用户按需在面板/配置里显式切档。
+	c.Features.ReasoningHistory = upstream.ReasoningHistoryFull
+	// 11115 下调 max_tokens 重试默认**开**：只在 11115 时生效、失败逐字退回首次原文
+	// （客户端报错口径不变），最坏情形只是多打一次上游——详见 Features 字段注释。
+	c.Features.PTLMaxTokensRetry = true
+	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	c.Pool.MaxInFlight = 3
+	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403
+	// 修复 P1-1）；0/负数 normalize 回落本默认。
+	c.Pool.MaxInFlightGlobal = 2
+	c.Pool.BreakerThreshold = 3
+	c.Pool.BreakerCooldown = "30m"
+	c.Pool.BreakerCooldownMax = "6h"
+	// 连败降权（issue #114）默认开启：阈值 5（宽于熔断 3——ErrClient/传输层的判据
+	// 比 5xx 弱，须更保守）、固定 10m（长于单次软冷却、短于熔断基数 30m）。
+	// 「关闭」由把阈值设成很大（如 1000000）表达，不另设 enabled 开关——
+	// 与熔断阈值族同风格（无 breaker_enabled，靠阈值表达）。
+	c.Pool.DegradeThreshold = 5
+	c.Pool.DegradeCooldown = "10m"
+	c.Pool.DegradeCooldownMax = "2h"
+	c.Pool.IdleWeightPerHour = 0.5
+	c.Pool.IdleWeightMax = 5.0
+	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	// 选号模式缺省 weighted：与加本键前逐字节一致（顺序模式是用户显式选择的行为变更）。
+	c.Pool.PickMode = PoolPickModeWeighted
+	// 保留积分线缺省 50（用户点名"默认搞个 50"）：余额用到只剩 50 时该号对贵模型出池，
+	// 只留免费模型可用。键缺席时 Default() 的值被保留（Load 先取 Default 再 unmarshal）；
+	// 显式 0 才关闭。
+	c.Pool.ReserveCredits = DefaultReserveCredits
+	c.Pool.DeepseekSGFallback = true
+	c.SessionSticky.Enabled = true
+	c.SessionSticky.TTL = "30m"
+	c.SessionSticky.GCInterval = "5m"
+	return c
+}
+
+// Load 从文件读，再用 WB2A_* env 覆盖。
+func Load(path string) (*Config, error) {
+	c := Default()
+	if path != "" {
+		// 目录检查：Docker bind mount 在宿主机文件缺失时会静默创建同名目录，
+		// 直接 ReadFile 会报 "Incorrect function" 之类晦涩错误，这里给出可操作提示。
+		if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
+			return nil, fmt.Errorf("config %s 是目录而非文件——"+
+				"Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
+				"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）", path)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		if _, err := ParseConfigInto(raw, c); err != nil {
+			return nil, err
+		}
+	}
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// ParseConfigInto 把 JSON 覆盖到 c 上并 normalize（不做 env、不读文件）。
+// 面板保存配置走这条路径：与 Load 完全同一套解析/校验逻辑，避免两处漂移。
+func ParseConfigInto(raw []byte, c *Config) (*Config, error) {
+	if err := json.Unmarshal(raw, c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// ParseConfig 基于默认值解析一段配置 JSON（等价于 Load 的文件分支，但不读环境变量）。
+func ParseConfig(raw []byte) (*Config, error) {
+	return ParseConfigInto(raw, Default())
+}
+
+// WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
+// 值取自 Default()（含超时/熔断/签到排程等推荐值），api_key 用 crypto/rand 随机生成：
+// 安全默认优于示例占位符（listen 绑定 0.0.0.0，空 key 会把网关裸暴露给局域网）。
+// 返回生成的 key 供启动日志透出。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
+func WriteDefault(path string) (string, error) {
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("gen api_key: %w", err)
+	}
+	key := "sk-" + base64.RawURLEncoding.EncodeToString(raw)
+	c := Default()
+	c.APIKey = key
+	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
+	out, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal config: %w", err)
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", fmt.Errorf("mkdir config dir: %w", err)
+		}
+	}
+	// O_EXCL 原子拒绝覆盖：即使调用方漏判"不存在"，也绝不悄悄改写用户已有配置。
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("write config: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(out); err != nil {
+		return "", fmt.Errorf("write config: %w", err)
+	}
+	return key, nil
+}
+
+func applyEnv(c *Config) {
+	if v := os.Getenv("WB2A_LISTEN"); v != "" {
+		c.Listen = v
+	}
+	if v := os.Getenv("WB2A_API_KEY"); v != "" {
+		c.APIKey = v
+	}
+	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
+		c.AuthDir = v
+	}
+	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
+		c.StateFile = v
+	}
+	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.MaxBodyMB = n
+		}
+	}
+	// 入站 body 读取窗口（秒）：<=0 由 normalize 回落默认 300（env 与 JSON 同口径）。
+	if v := os.Getenv("WB2A_READ_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Server.ReadTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
+		c.Cooldown.SoftRate = v
+	}
+	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
+		c.Cooldown.SoftRateMax = v
+	}
+	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.TimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_HEADER_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.HeaderTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_IDLE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.IdleTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
+		c.Upstream.UserAgent = v
+	}
+	if v := os.Getenv("WB2A_CLIENT_VERSION"); v != "" {
+		c.Upstream.ClientVersion = v
+	}
+	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
+		c.Upstream.CliVersion = v
+	}
+	if v := os.Getenv("WB2A_CLIENT_NAME"); v != "" {
+		c.Upstream.ClientName = v
+	}
+	if v := os.Getenv("WB2A_DEVICE_TOKEN"); v != "" {
+		c.Upstream.DeviceToken = v
+	}
+	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
+		c.Upstream.DeviceTokenFile = v
+	}
+	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.PassthroughIP = b
+		}
+	}
+	if v := os.Getenv("WB2A_MACHINE_ID_HEADERS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.MachineIDHeaders = b
+		}
+	}
+	// 连接层四项 env 覆盖（与面板/JSON 同口径；名字对齐 JSON 键）。
+	if v := os.Getenv("WB2A_DISABLE_HTTP2"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Upstream.DisableHTTP2 = b
+		}
+	}
+	if v := os.Getenv("WB2A_TLS_HANDSHAKE_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.TLSHandshakeTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_DIAL_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.DialTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_IDLE_CONN_TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Upstream.IdleConnTimeoutSeconds = n
+		}
+	}
+	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.SanitizeBlacklistFingerprints = b
+		}
+	}
+	if v := os.Getenv("WB2A_ZEROWIDTH_SANITIZE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.ZeroWidthSanitize = b
+		}
+	}
+	// 档位字符串直接覆盖（归一化在 normalize()，与 JSON 同口径）。
+	if v := os.Getenv("WB2A_REASONING_HISTORY"); v != "" {
+		c.Features.ReasoningHistory = v
+	}
+	// 11115 下调 max_tokens 重试开关（默认 true；只有 true/false/1/0 等合法值生效）。
+	if v := os.Getenv("WB2A_PTL_MAX_TOKENS_RETRY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.PTLMaxTokensRetry = b
+		}
+	}
+	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
+		c.Prompt.Mode = v
+	}
+	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
+		c.Prompt.File = v
+	}
+	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
+		c.Pool.ExpiringSoon = v
+	}
+	// 连败降权（issue #114）：三个键的 env 覆盖，与 JSON 同口径（名字对齐 JSON 键）。
+	if v := os.Getenv("WB2A_DEGRADE_THRESHOLD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Pool.DegradeThreshold = n
+		}
+	}
+	if v := os.Getenv("WB2A_DEGRADE_COOLDOWN"); v != "" {
+		c.Pool.DegradeCooldown = v
+	}
+	if v := os.Getenv("WB2A_DEGRADE_COOLDOWN_MAX"); v != "" {
+		c.Pool.DegradeCooldownMax = v
+	}
+	// 选号模式（weighted/sequential）：归一化在 normalize()，与 JSON 同口径
+	// （非法值同样回落 weighted + warn，env 不做第二套校验）。
+	if v := os.Getenv("WB2A_PICK_MODE"); v != "" {
+		c.Pool.PickMode = v
+	}
+	// 保留积分线（pool.reserve_credits）：env 与 JSON 同口径（负数由 normalize fail fast）。
+	if v := os.Getenv("WB2A_RESERVE_CREDITS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Pool.ReserveCredits = n
+		}
+	}
+}
+
+func (c *Config) normalize() error {
+	var err error
+	// max_body_mb 语义（吸收上游 73fe1f8）：0 = **不预拦截**（默认），>0 = 网关侧
+	// 内存护栏（超限 413）。负数非法 fail fast——负的字节上限没有合理语义，静默当成
+	// 极小上限会把所有请求打成 413（最坏的反向风险），回落默认又会让"我配了个负数"
+	// 无声无息地变成"没护栏"。
+	if c.Server.MaxBodyMB < 0 {
+		return fmt.Errorf("server.max_body_mb: %d 非法（0 = 不预拦截，或正整数 MB 作为网关内存护栏）", c.Server.MaxBodyMB)
+	}
+	// max_rotate 非正回落默认 3（处理风格参照 pool.max_in_flight_global）：0/负数
+	// 在这里没有「不限」之类的合理语义（「不限换号」可用超大值表达），报错只会让
+	// 手写配置的部署起不来；回落默认既保住零行为变更，又不必用户猜合法区间。
+	if c.Server.MaxRotate <= 0 {
+		c.Server.MaxRotate = 3
+	}
+	// read_timeout_seconds 非正回落默认（与 max_rotate 同风格，理由见字段注释：
+	// http.Server 的「0 = 不限」语义在此刻意不采纳——拆掉慢速 body 闸门是反向风险）。
+	// 回落值取 server.DefaultReadTimeout，与 handler 侧兜底同源。
+	if c.Server.ReadTimeoutSeconds <= 0 {
+		c.Server.ReadTimeoutSeconds = int(server.DefaultReadTimeout / time.Second)
+	}
+	if c.Logging.RequestRetentionDays <= 0 {
+		c.Logging.RequestRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 100
+	}
+	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
+		return fmt.Errorf("cooldown.soft_rate: %w", err)
+	}
+	// 空值回落默认 2h（Default() 已置值；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	if c.Cooldown.SoftRateMax == "" {
+		c.Cooldown.SoftRateMax = "2h"
+	}
+	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
+		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+	}
+	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown: %w", err)
+	}
+	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
+	}
+	// 连败降权（issue #114）：时长两键空值先回落默认再解析（空串无法 ParseDuration），
+	// 非法值 fail fast——与 breaker 族同风格（见上方 soft_rate_max 的空值回落）。
+	if c.Pool.DegradeCooldown == "" {
+		c.Pool.DegradeCooldown = "10m"
+	}
+	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown: %w", err)
+	}
+	if c.Pool.DegradeCooldownMax == "" {
+		c.Pool.DegradeCooldownMax = "2h"
+	}
+	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
+	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
+		return fmt.Errorf("session_sticky.ttl: %w", err)
+	}
+	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
+		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
+	if c.Pool.ExpiringSoon != "" {
+		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
+			return fmt.Errorf("pool.expiring_soon: %w", err)
+		}
+	}
+	if c.Pool.BreakerThreshold <= 0 {
+		c.Pool.BreakerThreshold = 3
+	}
+	// 连败降权阈值：<=0 回落默认 5（与 breaker_threshold 同风格；0 无「关闭」语义，
+	// 关闭请设一个极大值——见 Default() 注释）。
+	if c.Pool.DegradeThreshold <= 0 {
+		c.Pool.DegradeThreshold = 5
+	}
+	// global 在途分档：0/负数视为未设置回落默认 2（WAF 403 修复 P1-1）。
+	// 与 max_in_flight 的 0=不限语义不同——分档键的 0 没有合理语义（「global 不限」
+	// 用超大值表达即可），回退分档默认最稳。
+	if c.Pool.MaxInFlightGlobal <= 0 {
+		c.Pool.MaxInFlightGlobal = 2
+	}
+	if c.Pool.IdleWeightPerHour <= 0 {
+		c.Pool.IdleWeightPerHour = 0.5
+	}
+	if c.Pool.IdleWeightMax <= 0 {
+		c.Pool.IdleWeightMax = 5.0
+	}
+	if c.Upstream.TimeoutSeconds <= 0 {
+		c.Upstream.TimeoutSeconds = 120
+	}
+	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
+	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
+	if c.Upstream.HeaderTimeoutSeconds <= 0 {
+		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
+	}
+	if c.Upstream.IdleTimeoutSeconds <= 0 {
+		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// 连接层三项超时：<=0 一律回落推荐值（与 Default() 同值，幂等）。不回落到
+	// timeout_seconds——它们语义独立（握手/建连是连接层，timeout_seconds 是短
+	// RPC 总时长），混用会让「短请求超时调小」意外把握手闸门也收紧。
+	// DisableHTTP2 无回落：bool 的 false 就是「启用 h2」（默认），无需兜底。
+	if c.Upstream.TLSHandshakeTimeoutSeconds <= 0 {
+		c.Upstream.TLSHandshakeTimeoutSeconds = 30
+	}
+	if c.Upstream.DialTimeoutSeconds <= 0 {
+		c.Upstream.DialTimeoutSeconds = 30
+	}
+	if c.Upstream.IdleConnTimeoutSeconds <= 0 {
+		c.Upstream.IdleConnTimeoutSeconds = 90
+	}
+	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
+		c.Listen = ":" + c.Listen
+	}
+	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
+	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
+	if len(c.Schedule.CheckinHours) == 0 {
+		c.Schedule.CheckinHours = []int{9, 21}
+	}
+	if len(c.Schedule.TravelHours) == 0 {
+		c.Schedule.TravelHours = []int{9, 21}
+	}
+	if len(c.Schedule.ActivityHours) == 0 {
+		c.Schedule.ActivityHours = []int{10}
+	}
+	if len(c.Schedule.KeepaliveHours) == 0 {
+		c.Schedule.KeepaliveHours = []int{22}
+	}
+	if len(c.Schedule.BlackcatHours) == 0 {
+		c.Schedule.BlackcatHours = []int{23}
+	}
+	// growth 的回落是**独立**的 if 块（上游 74c324a 把它误嵌在 blackcat 块内：
+	// blackcat_hours 非空时 growth_hours 空值不回落，排程被 nextFire 零值静默跳过）。
+	if len(c.Schedule.GrowthHours) == 0 {
+		c.Schedule.GrowthHours = []int{1}
+	}
+	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
+	if c.Schedule.BalanceRefreshEnabled {
+		if c.Schedule.BalanceRefreshMinutes <= 0 {
+			c.Schedule.BalanceRefreshMinutes = 5
+		}
+		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+	// auths 目录热加载：启用时 seconds<=0 回落默认 30；关闭时 interval 保持 0（不扫描）。
+	// 与余额刷新同一形态：0 是「开关关闭」的哨兵，故 <=0 一律先回落再判。
+	if c.Schedule.AuthWatchEnabled {
+		if c.Schedule.AuthWatchSeconds <= 0 {
+			c.Schedule.AuthWatchSeconds = 30
+		}
+		c.AuthWatchInterval = time.Duration(c.Schedule.AuthWatchSeconds) * time.Second
+	}
+	// 后台冷却探活：启用时 minutes<=0 回落默认 10；关闭时 interval 保持 0（循环暂停）。
+	// 与余额刷新/authwatch 同一形态（0 是「开关关闭」的哨兵，故 <=0 一律先回落再判）。
+	if c.Schedule.CooldownProbeEnabled {
+		if c.Schedule.CooldownProbeMinutes <= 0 {
+			c.Schedule.CooldownProbeMinutes = 10
+		}
+		c.CooldownProbeInterval = time.Duration(c.Schedule.CooldownProbeMinutes) * time.Minute
+	}
+	if err := c.validateScheduleHours(); err != nil {
+		return err
+	}
+	// models.realm_precedence：只认 cn/global；空（键缺席时 Default() 已置 global，
+	// 此处覆盖显式 ""）与非法值统一回落 global，不静默变成 cn。
+	switch strings.ToLower(strings.TrimSpace(c.Models.RealmPrecedence)) {
+	case "cn":
+		c.Models.RealmPrecedence = "cn"
+	default:
+		c.Models.RealmPrecedence = "global"
+	}
+	// features.reasoning_history：三档字符串（full/last/blank）。合法值归一化
+	// （大小写/首尾空白不敏感）；非法值（空串/未知）**回落 full 并记 warn**，
+	// 不 fail fast——理由见字段注释（默认关闭的性能开关，回落 full = 行为与改动前
+	// 逐字节一致，静默失败的方向是"没省到 token"而不是"改坏了请求"）。
+	if mode, ok := upstream.NormalizeReasoningHistoryMode(c.Features.ReasoningHistory); ok {
+		c.Features.ReasoningHistory = mode
+	} else {
+		log.Printf("features.reasoning_history: %q 不是合法档位（full/last/blank），已按 full 处理", c.Features.ReasoningHistory)
+		c.Features.ReasoningHistory = upstream.ReasoningHistoryFull
+	}
+	// pool.pick_mode：合法值归一化（大小写/首尾空白不敏感）；非法值（空串/未知）
+	// **回落 weighted 并记 warn**，不 fail fast——理由见字段注释：缺省方向必须与
+	// 加本键前逐字节一致，静默失败的方向是"保持旧行为"（不会把用户没要求的顺序模式
+	// 悄悄打开，也不会因为拼错一个词就让网关起不来）。
+	if mode, ok := NormalizePickMode(c.Pool.PickMode); ok {
+		c.Pool.PickMode = mode
+	} else {
+		log.Printf("pool.pick_mode: %q 不是合法模式（weighted/sequential），已按 weighted 处理", c.Pool.PickMode)
+		c.Pool.PickMode = PoolPickModeWeighted
+	}
+	// pool.reserve_credits：负数非法 → fail fast（风格同 server.max_body_mb）。负的保留线
+	// 没有合理语义，而静默钳 0 等于把用户写错的配置变成"关掉了这个功能"且不提示——
+	// 正是 issue #17 那类"改了配置却不生效还不说"的失效模式。0 合法（= 显式关闭）。
+	if c.Pool.ReserveCredits < 0 {
+		return fmt.Errorf("pool.reserve_credits: %d 非法（0 = 关闭该功能，或正整数作为保留积分线）", c.Pool.ReserveCredits)
+	}
+	return c.normalizePrompt()
+}
+
+// pool.pick_mode 的合法值（JSON 字符串形态，小写）。
+const (
+	// PoolPickModeWeighted 三因子加权随机（缺省）。
+	PoolPickModeWeighted = "weighted"
+	// PoolPickModeSequential 顺序填充式选号。
+	PoolPickModeSequential = "sequential"
+)
+
+// DefaultReserveCredits pool.reserve_credits 的缺省值（用户指定"默认搞个 50"）。
+//
+// 提为常量而不是在两处各写 50：默认值同时出现在 Default()（键缺席）与面板表单的
+// placeholder（index.html 的显示值），两处漂移会让"面板显示 50、实际按别的数跑"。
+// 面板 HTML 无法引用 Go 常量（go:embed 静态资源），故那边由 frontend_test 断言
+// placeholder 与本常量一致。
+const DefaultReserveCredits = 50
+
+// NormalizePickMode 归一化 pool.pick_mode：大小写/首尾空白不敏感，返回归一化值与
+// 是否合法。空串视为**非法**（由调用方回落 weighted 并 warn）——空串与"键缺席"
+// 在 Default() 已填默认值的前提下无法区分，统一走 warn 分支对排查更友好
+// （若用户手写 "pick_mode": "" 是明确的配置错误信号）。
+func NormalizePickMode(s string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case PoolPickModeWeighted:
+		return PoolPickModeWeighted, true
+	case PoolPickModeSequential:
+		return PoolPickModeSequential, true
+	default:
+		return "", false
+	}
+}
+
+// PickMode 把归一化后的配置字符串映射为 pool 的枚举（未知一律缺省 weighted，
+// 与 NormalizePickMode 的兜底同口径——本函数不负责报错/告警）。
+func PickMode(cfgVal string) pool.PickMode {
+	if mode, ok := NormalizePickMode(cfgVal); ok && mode == PoolPickModeSequential {
+		return pool.PickSequential
+	}
+	return pool.PickWeighted
+}
+
+// normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom 模式）。
+//
+// mode 非法（非 custom/passthrough）启动报错，避免静默回落到某一分支；
+// custom 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认。
+// passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+func (c *Config) normalizePrompt() error {
+	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
+	case "", "passthrough":
+		c.Prompt.Mode = "passthrough"
+	case "custom":
+		c.Prompt.Mode = "custom"
+	default:
+		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom）", c.Prompt.Mode)
+	}
+	if c.Prompt.Mode == "custom" {
+		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
+		if err != nil {
+			return err
+		}
+		c.PromptText = text
+	}
+	return nil
+}
+
+// validateScheduleHours 校验排程小时落在 0-23。
+//
+// 为什么不用 `[-1]` 之类的哨兵值表意"禁用"：非法小时被静默吞掉时，用户以为关掉了签到，
+// 实际可能被当成另一个整点照常执行；这里直接快速失败，并在错误信息里指向正确的开关
+// （checkin_enabled / keepalive_enabled），避免用户靠猜哨兵值来配。
+func (c *Config) validateScheduleHours() error {
+	if err := checkHourRange("schedule.checkin_hours", "checkin_enabled", c.Schedule.CheckinHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.travel_hours", "travel_enabled", c.Schedule.TravelHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.activity_hours", "activity_enabled", c.Schedule.ActivityHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
+		return err
+	}
+	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
+}
+
+func checkHourRange(field, switchKey string, hours []int) error {
+	for _, h := range hours {
+		if h < 0 || h > 23 {
+			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false", field, h, switchKey)
+		}
+	}
+	return nil
+}

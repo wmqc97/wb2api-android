@@ -1,0 +1,32 @@
+# Go 工具链与缓存
+.build/
+.gocache/
+.gopath/
+.gotmp/
+.gradle-home/
+gopath/
+
+# Gradle / Android
+.gradle/
+local.properties
+keystore.properties
+build/
+*.iml
+.idea/
+.cxx/
+captures/
+
+# 构建产物
+app/src/main/jniLibs/**/libwb2api.so
+*.apk
+*.aab
+*.idsig
+
+# 运行期数据（App 私有目录的镜像，正常不会落在这里）
+server/config.json
+server/auths/
+server/data/
+
+# 本地临时文件
+.tmp-*
+$null
