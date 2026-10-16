@@ -101,6 +101,11 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	setupMu      sync.Mutex
+	setupQueue   []*auth.Auth
+	setupPending map[string]bool
+	setupWorkers int
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -136,6 +141,7 @@ const loginTTL = 15 * time.Minute
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
+	polling bool
 }
 
 // New 构建面板。
@@ -375,7 +381,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	// 多少钱"。实测（真实 global 账号）：deepseek-v4.1-flash 走 v3-CLI 带出 x0.00、
 	// -sg 带出 x0.03、hy4-preview 取企业端点的 x0.00（计费目录权威，不被 v3 牌价
 	// x0.29 覆盖，见 MergeCatalogOverlay §2）。
-	infos, diag, err := p.cfg.Upstream.FetchModelsDiag(acct)
+	if p.cfg.Upstream == nil {
+		writeErr(w, http.StatusServiceUnavailable, "上游客户端未配置")
+		return
+	}
+	infos, diag, err := p.cfg.Upstream.FetchModelsDiagContext(r.Context(), acct)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "fetch models: "+err.Error())
 		return

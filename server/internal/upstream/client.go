@@ -842,6 +842,9 @@ type Client struct {
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
 
+	modelCatalogMu sync.RWMutex
+	modelCatalog   map[string]map[string]bool
+
 	// sanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	// 面板保存配置时热改（SetSanitizeFingerprints），与请求路径 prepareBody 的读
 	// 属于不同 goroutine——裸 bool 在 Go 内存模型下是数据竞争，故用 atomic。
@@ -1548,14 +1551,36 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 
 // FetchModelsDiag 同 FetchModels，另外返回诊断快照（供面板展示"上游给了什么"）。
 func (c *Client) FetchModelsDiag(a *auth.Auth) ([]ModelInfo, ModelFetchDiag, error) {
+	return c.FetchModelsDiagContext(context.Background(), a)
+}
+
+const modelRequestTimeout = 4 * time.Second
+
+// FetchModelsDiagContext bounds the complete catalog lookup, including endpoint
+// fallbacks and optional capability probes. Cancellation reaches HTTP reads.
+func (c *Client) FetchModelsDiagContext(ctx context.Context, a *auth.Auth) ([]ModelInfo, ModelFetchDiag, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	var lastErr error
 	var lastDiag ModelFetchDiag
 	for _, path := range c.modelsPaths(a) {
-		out, diag, err := c.fetchModelsOnce(a, path)
+		if ctx.Err() != nil {
+			return nil, lastDiag, ctx.Err()
+		}
+		out, diag, err := c.fetchModelsOnce(ctx, a, path)
 		if err == nil {
+			c.recordModelCatalog(a.Realm(), out)
 			return out, diag, nil
 		}
 		lastDiag, lastErr = diag, err
+	}
+	// The enterprise directory can fail while /v3/config remains available.
+	if overlay, ok := c.v3OverlayForContext(ctx, a); ok && len(overlay) > 0 {
+		out := v3CatalogInfos(overlay)
+		out = MergeCatalogOverlay(out, overlay, nil)
+		c.cacheModelEfforts(a, out)
+		c.recordModelCatalog(a.Realm(), out)
+		return out, ModelFetchDiag{Path: "/v3/config"}, nil
 	}
 	return nil, lastDiag, lastErr
 }
@@ -1573,15 +1598,15 @@ func (c *Client) FetchModelsDiag(a *auth.Auth) ([]ModelInfo, ModelFetchDiag, err
 // 为什么与 FetchGlobalModelInfos 的探测共用 probeGlobalV3Capabilities 而不各写一份：
 // 同一个"哪几路 UA、怎么合并"的知识写两遍必然漂移（一处改了另一处忘了，症状是
 // "目录探测有 deepseek、面板列表没有"这类极难发现的错配）。
-func (c *Client) v3OverlayFor(a *auth.Auth) (map[string]ModelInfo, bool) {
+func (c *Client) v3OverlayForContext(ctx context.Context, a *auth.Auth) (map[string]ModelInfo, bool) {
 	if c.globalOn(a) {
-		cap, ok := c.probeGlobalV3Capabilities(a)
+		cap, ok := c.probeGlobalV3CapabilitiesContext(ctx, a)
 		if !ok {
 			log.Printf("WARN: [upstream] models: v3/config overlay failed (realm=global, 双 UA 全失败) —— 模型能力补全与限时优惠 promo_* 本轮不可用")
 		}
 		return cap, ok
 	}
-	overlay, err := c.fetchV3ConfigModelMap(a, codeBuddyIDEUA)
+	overlay, err := c.fetchV3ConfigModelMapContext(ctx, a, codeBuddyIDEUA)
 	if err != nil {
 		log.Printf("WARN: [upstream] models: v3/config overlay failed (realm=cn) —— 模型能力补全与限时优惠 promo_* 本轮不可用: %v", err)
 		return nil, false
@@ -1590,11 +1615,13 @@ func (c *Client) v3OverlayFor(a *auth.Auth) (map[string]ModelInfo, bool) {
 }
 
 // fetchModelsOnce 单个候选端点拉取 + 解析（含 /v3/config 能力覆盖与 effort 缓存刷新）。
-func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelFetchDiag, error) {
+func (c *Client) fetchModelsOnce(ctx context.Context, a *auth.Auth, path string) ([]ModelInfo, ModelFetchDiag, error) {
 	diag := ModelFetchDiag{Path: path}
 	// 局部变量名避开 url（本包已 import net/url，同名会造成阅读混淆）。
 	endpoint := c.chatBase(a) + path
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	reqCtx, cancel := context.WithTimeout(ctx, modelRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, diag, err
 	}
@@ -1785,7 +1812,7 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 			out[i] = base[out[i].ID]
 		}
 	}
-	if overlay, ok := c.v3OverlayFor(a); ok {
+	if overlay, ok := c.v3OverlayForContext(ctx, a); ok {
 		// 单一合并入口（catalog.go）：能力覆盖 + credits 以企业端点优先 +
 		// 追加 v3 独有 id。重写前这里调 mergeModelCapabilities——**没有追加步**，
 		// 于是 CLI 路独有的 5 条（deepseek-v4.1-flash-sg / glm-5.3-flash /
@@ -1816,6 +1843,11 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 		}
 		sort.Strings(diag.V3OnlyIDs)
 	}
+	c.cacheModelEfforts(a, out)
+	return out, diag, nil
+}
+
+func (c *Client) cacheModelEfforts(a *auth.Auth, out []ModelInfo) {
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
 	cache := make(map[string][]string, len(out))
 	defCache := make(map[string]string, len(out))
@@ -1841,7 +1873,6 @@ func (c *Client) fetchModelsOnce(a *auth.Auth, path string) ([]ModelInfo, ModelF
 	c.efforts[realmBucket] = cache
 	c.defaultEfforts[realmBucket] = defCache
 	c.effortsMu.Unlock()
-	return out, diag, nil
 }
 
 // v3ConfigDomain /v3/config 的 X-Domain：优先账号落盘 domain，否则 chatBase host。
@@ -1867,7 +1898,13 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 //
 // ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。
 func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
-	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
+	return c.fetchV3ConfigModelMapContext(context.Background(), a, ua)
+}
+
+func (c *Client) fetchV3ConfigModelMapContext(ctx context.Context, a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, modelRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
 		return nil, err
 	}

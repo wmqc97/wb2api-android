@@ -42,7 +42,7 @@ import (
 // 之所以用 var 而非 const：const 无法被 -ldflags -X 覆盖，版本号就得手改源码，
 // 于是很容易留下 `+dirty` / `+realmfix` 这类构建期后缀与源码里写死的字符串对不上。
 // 单一来源 = git tag，产物版本号永远可复现、无后缀。
-var appVersion = "v1.9.38"
+var appVersion = "v1.9.41"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -122,6 +122,7 @@ func main() {
 	p.SetReserveCredits(int64(cfg.Pool.ReserveCredits))
 
 	// 会话粘性路由（可配关闭）。
+	up := upstream.New()
 	var sessRouter *session.Router
 	redisMode := "noop"
 	if _, ok := store.(redisstore.Noop); !ok {
@@ -130,7 +131,7 @@ func main() {
 	if cfg.SessionSticky.Enabled {
 		// 装配（含 pool.pick_mode → 粘性侧的顺序开关）见 wiring.go 的 newSessionRouter：
 		// 与 cmd/server 的接线测试共用同一份，避免"测试另写装配"漏掉接线回归。
-		sessRouter = newSessionRouter(cfg, p, store)
+		sessRouter = newSessionRouter(cfg, p, store, up.ModelRealms)
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
 		defer sessRouter.StopGC()
@@ -142,7 +143,6 @@ func main() {
 		return 0
 	}
 
-	up := upstream.New()
 	// 保留积分的「免费/低价模型」判定回调（pool.reserve_credits 的模型感知部分）：
 	// 数据源是 CN（cachedCatalogSnapshot）与 global（GlobalModelInfosStaleSnapshot）两个
 	// **只读目录快照**（都陈旧容错：超 TTL 后仍按最近一次成功目录作答，避免刷新空档期

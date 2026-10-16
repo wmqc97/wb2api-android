@@ -4,13 +4,14 @@
 //	  原方案在 Windows 上不可用），返回授权 URL；
 //	GET  /panel/api/login/poll   → 面板前端每 3s 轮询本接口；未完成返回 done=false，
 //	  完成后取 uid/nickname、凭证落盘 auths/workbuddy-<uid>.json、热加载进池
-//	  （pool.Add + Revive），并顺带签到 + 余额刷新 —— 免重启加载新账号。
+//	  （pool.Add + Revive），后台执行签到与余额刷新，免重启加载新账号。
 //
 // 无 PKCE（workbuddy 设备流由服务端签发 state），请求头与上游端点与 cmd/login 保持一致。
 package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,8 +22,6 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 const (
@@ -88,7 +87,11 @@ type apiEnvelope struct {
 
 // doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
 func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
+	return doJSONContext(context.Background(), method, fullURL, bearer, body, origin)
+}
+
+func doJSONContext(ctx context.Context, method, fullURL, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -165,15 +168,34 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.loginMu.Lock()
 	sess, known := p.logins[state]
+	if known && !sess.polling {
+		next := sess
+		next.polling = true
+		p.logins[state] = next
+	}
 	p.loginMu.Unlock()
 	if !known {
 		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
 		return
 	}
+	if sess.polling {
+		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "正在确认登录"})
+		return
+	}
+	defer func() {
+		p.loginMu.Lock()
+		if current, ok := p.logins[state]; ok {
+			current.polling = false
+			p.logins[state] = current
+		}
+		p.loginMu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
 	_, epToken, epAcct, origin := loginEndpoints(sess.realm)
 
 	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
-	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
+	tokRaw, _, err := doJSONContext(ctx, http.MethodGet, epToken+state, "", nil, origin)
 	if err != nil {
 		// pending / 未完成：面板前端继续轮询。
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
@@ -196,7 +218,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	}
-	if acctRaw, _, err := doJSON(http.MethodGet, epAcct+state, tok.AccessToken, nil, origin); err == nil {
+	if acctRaw, _, err := doJSONContext(ctx, http.MethodGet, epAcct+state, tok.AccessToken, nil, origin); err == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 	if acct.UID == "" {
@@ -243,76 +265,21 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
-	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
-	// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取
-	// （D4 门控同 scheduler：CN 任务端点对 global 不发起任何调用）。
-	checkinMsg := ""
-	remain := int64(-1)
-	total := int64(0)
-	if sess.realm == "global" {
-		// 注册激活（幂等）：region required 时自动补地区（白名单首个，HK）后重新激活。
-		// 失败不阻断登录结果（auth 已落盘），只在返回字段里体现。
-		if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-			checkinMsg = "注册激活失败: " + err.Error()
-			log.Printf("panel: global 注册激活 uid=%s: %v", acct.UID, err)
-		} else if activated {
-			log.Printf("panel: global 注册激活 uid=%s 完成", acct.UID)
-		}
-		// trial 加油包（幂等 14051 = 已领过，非错误）。
-		if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-			checkinMsg = joinMsg(checkinMsg, "trial 领取失败: "+err.Error())
-			log.Printf("panel: global trial uid=%s: %v", acct.UID, err)
-		} else if claimed {
-			log.Printf("panel: global trial uid=%s 已领", acct.UID)
-		}
-	} else if !a.IsEnterprise() {
-		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
-		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
-		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
-		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-			checkinMsg = err.Error()
-		}
-	}
-	// 登录后的余额回填：与后台刷新同一对入口（ReenableIfCredits 写余额/解冻、
-	// SetCreditsExpiring 无条件同步快过架子集）——重新登录同一账号时，旧的分桶值
-	// 也必须跟着本次余额一起更新，否则会残留一个可能大于新 credits 的陈旧子集
-	// （weightOf 的占比项会据此放大选号权重）。
-	if rm, tt, exp, diag, err := p.cfg.Upstream.UserResourceDetailedDiag(a, p.expiringSoonWindow()); err == nil {
-		remain, total = rm, tt
-		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
-		p.cfg.Pool.SetCreditsExpiringAt(acct.UID, exp, diag.ExpiringEnd)
-		log.Printf("panel: login balance uid=%s %s", logfmt.UID8(acct.UID),
-			upstream.BalanceLine(rm, tt, exp, diag))
-	}
+	p.queueAccountSetup(a)
 
 	p.loginMu.Lock()
 	delete(p.logins, state)
 	p.loginMu.Unlock()
 	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"done":            true,
-		"uid":             acct.UID,
-		"nickname":        acct.Nickname,
-		"realm":           sess.realm,
-		"credits":         remain,
-		"credits_total":   total,
-		"checkin_message": checkinMsg,
+		"done":                true,
+		"uid":                 acct.UID,
+		"nickname":            acct.Nickname,
+		"realm":               sess.realm,
+		"credits":             int64(-1),
+		"credits_total":       int64(0),
+		"maintenance_pending": p.cfg.Upstream != nil,
 	})
-}
-
-// joinMsg 拼接 login 完成后的提示消息（多段用「；」连接，空段跳过）。
-func joinMsg(parts ...string) string {
-	out := ""
-	for _, s := range parts {
-		if s == "" {
-			continue
-		}
-		if out != "" {
-			out += "；"
-		}
-		out += s
-	}
-	return out
 }
 
 // loginRegions 返回 global 注册可选地区（panel 前端选地区弹窗用；CN 不调用）。

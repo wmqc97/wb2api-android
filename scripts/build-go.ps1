@@ -18,7 +18,7 @@ param(
   [string]$Abi = 'all',
 
   # 注入 main.appVersion；留空则用源码里的默认值。
-  [string]$Version = 'v1.9.38'
+  [string]$Version = 'v1.9.41'
 )
 
 $ErrorActionPreference = 'Stop'

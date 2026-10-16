@@ -2,8 +2,6 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -548,17 +546,13 @@ func ParseConfig(raw []byte) (*Config, error) {
 }
 
 // WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
-// 值取自 Default()（含超时/熔断/签到排程等推荐值），api_key 用 crypto/rand 随机生成：
-// 安全默认优于示例占位符（listen 绑定 0.0.0.0，空 key 会把网关裸暴露给局域网）。
-// 返回生成的 key 供启动日志透出。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
+// 值取自 Default()（含超时/熔断/签到排程等推荐值）。
+// api_key 留空 = 默认不开启鉴权：面板/接口直接打开即可用，不必先粘贴密钥。
+// 返回生效的 api_key（本分支恒为空串）供启动日志透出。
+// 需要鉴权时把 api_key 填进该文件即可（httpauth 对空 key 恒放行）。
+// 已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
 func WriteDefault(path string) (string, error) {
-	raw := make([]byte, 18)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("gen api_key: %w", err)
-	}
-	key := "sk-" + base64.RawURLEncoding.EncodeToString(raw)
 	c := Default()
-	c.APIKey = key
 	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
 	out, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
@@ -578,7 +572,7 @@ func WriteDefault(path string) (string, error) {
 	if _, err := f.Write(out); err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}
-	return key, nil
+	return c.APIKey, nil
 }
 
 func applyEnv(c *Config) {

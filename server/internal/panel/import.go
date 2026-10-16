@@ -105,41 +105,17 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		p.cfg.Pool.Add(a)
 		p.cfg.Pool.Revive(uid)
 
-		// 收尾（签到 / 激活 / 试用）：全部幂等，失败只记日志不阻断导入——导入本身
-		// 已经成功（凭证已落盘进池），收尾失败不该让用户以为整条没进来。
-		if p.cfg.Upstream == nil {
-			imported++
-			continue
-		}
-		if realm == "global" {
-			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-				log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
-			} else if activated {
-				log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
-			}
-			if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-				log.Printf("panel: import global trial uid=%s: %v", uid, err)
-			} else if claimed {
-				log.Printf("panel: import global trial uid=%s 已领", uid)
-			}
-		} else if !a.IsEnterprise() {
-			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-				log.Printf("panel: import checkin uid=%s: %v", uid, err)
-			}
-		}
-		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
-		}
-
 		imported++
+		p.queueAccountSetup(a)
 	}
 
 	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", len(accounts), imported, skipped)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"total":    len(accounts),
-		"imported": imported,
-		"skipped":  skipped,
-		"errors":   errs,
+		"ok":                  true,
+		"total":               len(accounts),
+		"imported":            imported,
+		"skipped":             skipped,
+		"errors":              errs,
+		"maintenance_pending": imported > 0 && p.cfg.Upstream != nil,
 	})
 }

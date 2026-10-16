@@ -17,13 +17,17 @@ import (
 //     顺序模式只改了 Pool.Pick 的挑选方式，而"新会话绑到哪个号"走的是
 //     session.Router.assign（另一条分配路径），缺了这条接线时带会话键的客户端
 //     （绝大多数）仍被哈希分散到各号，顺序模式形同未开。
-func newSessionRouter(cfg *Config, p *pool.Pool, store redisstore.Store) *session.Router {
+func newSessionRouter(cfg *Config, p *pool.Pool, store redisstore.Store, catalogs ...func(string) (bool, bool)) *session.Router {
+	router := cfg.realmRouter(p)
+	if len(catalogs) > 0 {
+		router.ModelRealms = catalogs[0]
+	}
 	return session.New(session.Config{
 		TTL:               cfg.SessionTTL,
 		GCInterval:        cfg.SessionGCInterval,
 		Store:             store,
 		Available:         p.AvailableUIDs,
-		AvailableForModel: realmAwareAvailableForModel(p, cfg.realmRouter(p)),
+		AvailableForModel: realmAwareAvailableForModel(p, router),
 		Sequential:        PickMode(cfg.Pool.PickMode) == pool.PickSequential,
 	})
 }

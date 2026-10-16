@@ -22,8 +22,8 @@ func splitRealmPrefix(model string) (realm, bare string, ok bool) {
 //
 // 规则：
 //  1. 显式 "cn:"/"global:" 前缀优先——老客户端配置里写死的带前缀模型名零改动。
-//  2. 裸名按池内可用域决定：只有一域有账号 → 该域；两域都有 → Precedence；
-//     两域都无 → Precedence（随后选号必然 503，与历史行为一致）。
+//  2. 裸名若只出现在一个域的目录中，直接归属该域。
+//  3. 两域共有或归属未知时，按池内可用域与 Precedence 决定。
 //
 // 单域部署（例如只登国际版账号）下裸名直接落到该域；配合 strip_realm_prefix
 // 即得到"输出无前缀、且裸名路由正确"的语义。
@@ -31,10 +31,12 @@ type RealmRouter struct {
 	// GlobalEnabled 与 handler 第三道闸同源（config global.enabled）。
 	// false 时 global 域视为不存在（纯 CN 锁定逃生门）。
 	GlobalEnabled bool
-	// Precedence 两域都有账号时裸名的默认域："global"（缺省）或 "cn"。
+	// Precedence applies to shared/unknown models when both realms have accounts.
 	Precedence string
 	// HasRealm 池内该域是否有账号；nil 视为无账号（测试可只给 Precedence）。
 	HasRealm func(realm string) bool
+	// ModelRealms reads the shared catalog snapshots without network calls.
+	ModelRealms func(model string) (cn, global bool)
 }
 
 // Resolve 解析模型名为 (realm, bareModel)。bare 用于选号/粘性/出站 body 重写
@@ -46,19 +48,41 @@ func (r RealmRouter) Resolve(model string) (realm, bare string) {
 
 // ResolveWithSource 同 Resolve，并额外报告 realm 是否来自显式前缀（用户强指定）。
 //
-// 显式性与跨域回落的关系（issue #199c）：显式 "cn:"/"global:" 前缀是客户端**写明**
-// 的意图，本域全不可用时也不跨域——换域可能违反用户意图（例如 CN 前缀是国际号受限
-// 时的显式规避，回落 global 等于把他送回去）；裸名归属只是网关的默认倾向
-// （realm_precedence），本域不可用时回落另一域是"尽量别 503"的合理默认。
-// 故 handler 据此对两种来源传不同的选号入口（硬过滤 vs 软优先）。
+// explicit only records the client's prefix. Use ResolveRoute's restricted flag
+// to decide fallback permission, since exclusive catalog groups also stay fixed.
 func (r RealmRouter) ResolveWithSource(model string) (realm, bare string, explicit bool) {
-	if realm, bare, ok := splitRealmPrefix(model); ok {
-		return realm, bare, true
-	}
-	return r.BareRealm(), model, false
+	realm, bare, explicit, _ = r.ResolveRoute(model)
+	return realm, bare, explicit
 }
 
-// BareRealm 返回裸模型名的归属域。
+// ResolveRoute snapshots grouping and fallback permission in the same lookup.
+func (r RealmRouter) ResolveRoute(model string) (realm, bare string, explicit, restricted bool) {
+	if realm, bare, ok := splitRealmPrefix(model); ok {
+		return realm, bare, true, true
+	}
+	if realm := r.CatalogRealm(model); realm != "" {
+		return realm, model, false, true
+	}
+	return r.BareRealm(), model, false, false
+}
+
+// CatalogRealm assigns models listed in just one catalog to that realm.
+// Shared and unknown models keep the configured realm precedence.
+func (r RealmRouter) CatalogRealm(model string) string {
+	if r.ModelRealms == nil || !r.GlobalEnabled {
+		return ""
+	}
+	cn, global := r.ModelRealms(model)
+	if cn && !global {
+		return "cn"
+	}
+	if global && !cn {
+		return "global"
+	}
+	return ""
+}
+
+// BareRealm returns the default realm for shared or unknown bare model names.
 func (r RealmRouter) BareRealm() string {
 	has := func(realm string) bool { return r.HasRealm != nil && r.HasRealm(realm) }
 	cn, gl := has("cn"), r.GlobalEnabled && has("global")

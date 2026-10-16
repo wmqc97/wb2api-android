@@ -1,9 +1,10 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-const LS_KEY = 'wb2api.key';
+const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
+let loginPollState = null;
 let refTimer = null;
 // 账号表拖拽排序的瞬时状态（null = 未在拖拽）：{uid, row}。见「账号拖拽排序」段。
 let dragState = null;
@@ -18,20 +19,21 @@ let poolLimits = null;
 const $ = id => document.getElementById(id);
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
-/* Android 壳通过 Wb2Api.systemDark() 提供系统设置；浏览器直接使用媒体查询。 */
+/* 三态主题：auto（跟随系统）/ light / dark，选择记在 localStorage 里。
+   首次访问跟随系统偏好，点按钮循环切换；手动选定后不再随系统变。
+   系统偏好走标准媒体查询（WebView 内可用），不依赖 Android 壳桥接。 */
 const themeMedia = matchMedia('(prefers-color-scheme: dark)');
+const THEME_LABEL = { auto: '跟随系统', light: '浅色', dark: '深色' };
 function systemDark() {
-  try {
-    if (window.Wb2Api && typeof window.Wb2Api.systemDark === 'function') {
-      return !!window.Wb2Api.systemDark();
-    }
-  } catch (e) {
-    // 浏览器没有壳桥接，回退到标准媒体查询。
-  }
-  return themeMedia.matches;
+  try { return themeMedia.matches; } catch (e) { return true; }
+}
+function themePref() {
+  const v = localStorage.getItem(LS_THEME);
+  return v === 'light' || v === 'dark' ? v : 'auto';
 }
 function effTheme() {
-  return systemDark() ? 'dark' : 'light';
+  const p = themePref();
+  return p === 'auto' ? (systemDark() ? 'dark' : 'light') : p;
 }
 function applyTheme() {
   const eff = effTheme();
@@ -39,29 +41,45 @@ function applyTheme() {
   $('icoTheme').innerHTML = eff === 'light'
     ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
     : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
-  $('btnTheme').title = '主题跟随系统设置（当前：' + (eff === 'light' ? '浅色' : '深色') + '）';
+  $('btnTheme').title = '主题：' + THEME_LABEL[themePref()]
+    + '（当前：' + (eff === 'light' ? '浅色' : '深色') + '，点击切换）';
 }
-function onSystemThemeChange() { applyTheme(); }
+/* 点击循环：跟随系统 → 浅色 → 深色 → 跟随系统。 */
+function cycleTheme() {
+  localStorage.setItem(LS_THEME, { auto: 'light', light: 'dark', dark: 'auto' }[themePref()]);
+  applyTheme();
+}
+function onSystemThemeChange() {
+  // 只有「跟随系统」时才随系统切换；手动选定的浅色/深色保持不变。
+  if (themePref() === 'auto') applyTheme();
+}
 if (typeof themeMedia.addEventListener === 'function') {
   themeMedia.addEventListener('change', onSystemThemeChange);
 } else if (typeof themeMedia.addListener === 'function') {
   themeMedia.addListener(onSystemThemeChange);
 }
-addEventListener('wb2api-theme-change', onSystemThemeChange);
-$('btnTheme').onclick = applyTheme;
+$('btnTheme').onclick = cycleTheme;
 applyTheme();
 
 /* ── 请求 ─────────────────────────────────────────────────────────── */
 async function api(path, opts = {}) {
-  const h = Object.assign({}, opts.headers || {});
+  const { timeoutMs = 0, ...requestOpts } = opts;
+  const controller = timeoutMs ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const h = Object.assign({}, requestOpts.headers || {});
   const k = localStorage.getItem(LS_KEY);
   if (k) h['Authorization'] = 'Bearer ' + k;
-  if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
-  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-  return d;
+  if (typeof requestOpts.body === 'string') h['Content-Type'] = 'application/json';
+  try {
+    const r = await fetch('/panel/api/' + path, Object.assign({}, requestOpts, { headers: h }, controller ? { signal: controller.signal } : {}));
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    return d;
+  } catch (e) {
+    if (controller && controller.signal.aborted) throw new Error('请求超时，请重试');
+    throw e;
+  } finally { if (timer) clearTimeout(timer); }
 }
 function toast(msg, cls) {
   const el = document.createElement('div');
@@ -561,6 +579,9 @@ async function loadOverview(quiet) {
     if (orderSaving > 0) return;
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
+    // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
+    // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
+    if ($('expBox') && !lastPackages) renderExpirySnapshot(d);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -911,7 +932,7 @@ function prefixedModelID(realm, id) {
    一直支持 ?realm=，但面板没有选择器 → 用户永远只看得到一个域、无从对比。
    选择器只渲染 realm_servable 为 true 的域（池内没账号的域不给按钮，点了必 503）。
    当前域记在 mdRealm；首次进入由后端回显决定（纯 CN 部署 → cn）。 */
-let mdRealm = null;
+let mdRealm = null, mdLoadSeq = 0;
 let mdCache = null;
 let mdFilter = {q: '', cap: '', effort: '', promo: '', sort: 'default'};
 function mdRateValue(m) {
@@ -986,6 +1007,7 @@ function renderModelRealms(d) {
     b.onclick = () => {
       if (b.dataset.realm === mdRealm) return;
       mdRealm = b.dataset.realm;
+      mdCache = null;
       loadModels();
     };
   });
@@ -995,12 +1017,14 @@ function renderModelRealms(d) {
 }
 
 async function loadModels(cached = false) {
+  const seq = ++mdLoadSeq;
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
     const q = mdRealm ? '?realm=' + mdRealm : '';
-    const [d, pr] = cached === true && mdCache ? mdCache : await Promise.all([api('models' + q), api('model_probes').catch(() => ({}))]);
+    const [d, pr] = cached === true && mdCache ? mdCache : await Promise.all([api('models' + q, { timeoutMs: 20000 }), api('model_probes', { timeoutMs: 5000 }).catch(() => ({}))]);
+    if (seq !== mdLoadSeq) return;
     mdCache = [d, pr];
     mdRealm = d.realm || mdRealm || 'global'; // 后端回显为准（缺省域由池内可用域决定）
     renderModelRealms(d);
@@ -1056,6 +1080,7 @@ async function loadModels(cached = false) {
       catch (e) { toast('复制失败，请手动选择：' + id, 'err'); }
     });
   } catch (e) {
+    if (seq !== mdLoadSeq) return;
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
@@ -1347,22 +1372,26 @@ function startAddLogin() {
 }
 function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
 async function pollLogin() {
-  if (!loginState) return;
+  if (!loginState || loginPollState === loginState) return;
+  const state = loginState;
+  loginPollState = state;
   try {
-    const r = await api('login/poll?state=' + encodeURIComponent(loginState));
+    const r = await api('login/poll?state=' + encodeURIComponent(state), { timeoutMs: 25000 });
+    if (state !== loginState) return;
     if (r.done) {
       stopPoll();
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
+      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中' + (r.maintenance_pending ? '，激活与余额在后台更新' : '');
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
+    if (state !== loginState) return;
     stopPoll();
     $('addReady').hidden = true;
     $('addErr').hidden = false;
     $('addErr').textContent = e.message + '（关闭后重新添加）';
-  }
+  } finally { if (loginPollState === state) loginPollState = null; }
 }
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
@@ -1370,8 +1399,7 @@ $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
-// cockpit tools 导出的 JSON 批量导入（吸收上游 9371f7d）：不走 api()——它固定
-// JSON body，这里要 multipart；密钥头手工带上（与 api() 同口径）。
+// Multipart imports share authentication and timeout handling with other APIs.
 $('importFile').onchange = async () => {
   const files = Array.from($('importFile').files || []);
   if (!files.length) return;
@@ -1379,21 +1407,17 @@ $('importFile').onchange = async () => {
   $('importDone').hidden = false; $('importErr').hidden = true;
   let imported = 0, skipped = 0;
   const errors = [];
-  const h = {}, k = localStorage.getItem(LS_KEY);
-  if (k) h.Authorization = 'Bearer ' + k;
   try {
     for (let i = 0; i < files.length; i++) {
       $('importDone').textContent = '正在导入 ' + (i + 1) + ' / ' + files.length + '：' + files[i].name;
       const fd = new FormData(); fd.append('file', files[i]);
       try {
-        const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
-        const d = await r.json();
-        if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        const d = await api('import/cockpit', { method: 'POST', body: fd, timeoutMs: 60000 });
         imported += d.imported || 0; skipped += d.skipped || 0;
         for (const msg of d.errors || []) errors.push(files[i].name + '：' + msg);
       } catch (e) { errors.push(files[i].name + '：' + e.message); }
     }
-    $('importDone').textContent = '导入完成：成功 ' + imported + ' 个，跳过 ' + skipped + ' 个';
+    $('importDone').textContent = '导入完成：成功 ' + imported + ' 个，跳过 ' + skipped + ' 个' + (imported ? '；激活、签到与余额在后台更新' : '');
     if (errors.length) {
       $('importErr').hidden = false;
       $('importErr').textContent = errors.slice(0, 50).join('\n') + (errors.length > 50 ? '\n其余 ' + (errors.length - 50) + ' 条省略' : '');
@@ -1622,7 +1646,7 @@ $('taskBody').addEventListener('click', async ev => {
    弹层体系，视觉与「积分任务」「添加账号」完全一致，不引入新样式语言。
    后端 POST /panel/api/account/test_chat 走真实 chat 出站路径但不计账号统计。 */
 const TC_DEFAULT_MODEL = 'deepseek-v4.1-flash'; // 写死条目：目录没有它也可调用
-let tcUID = null, tcEl = null;
+let tcUID = null, tcEl = null, tcModelSeq = 0;
 
 // testChatEl 惰性建弹窗（只建一次，反复打开复用同一节点）。
 function testChatEl() {
@@ -1677,22 +1701,28 @@ function openTestChat(uid) {
   loadTestChatModels(); // 不 await：下拉加载不阻塞弹窗出现
   setTimeout(() => $('tcMsg').focus(), 60);
 }
-function closeTestChat() { if (tcEl) tcEl.classList.remove('on'); tcUID = null; }
+function closeTestChat() { if (tcEl) tcEl.classList.remove('on'); tcUID = null; tcModelSeq++; }
 
 // 模型下拉复用 GET /panel/api/models（与「模型与档位」同一份目录）。
 // 拉取失败不阻塞测试：回落写死条目仍可手测（目录接口依赖上游可用账号）。
 async function loadTestChatModels() {
+  const seq = ++tcModelSeq, uid = tcUID;
+  const acct = (overviewData && overviewData.accounts || []).find(a => a.uid === uid);
+  const realm = acct && acct.realm;
   const sel = $('tcModel'), note = $('tcModelNote');
-  sel.disabled = true; sel.innerHTML = '<option value="">加载中…</option>';
-  note.textContent = '';
+  sel.disabled = false;
+  sel.innerHTML = '<option value="' + esc(TC_DEFAULT_MODEL) + '">' + esc(TC_DEFAULT_MODEL) + '</option>';
+  note.textContent = '正在更新模型目录，可先使用默认模型测试';
   try {
-    const d = await api('models');
+    const d = await api('models' + (realm ? '?realm=' + encodeURIComponent(realm) : ''), { timeoutMs: 20000 });
+    if (seq !== tcModelSeq || uid !== tcUID) return;
     const ids = (d.models || []).map(m => m.id).filter(Boolean);
     if (!ids.length) throw new Error('上游未返回模型');
     sel.innerHTML = ids.map(id => '<option value="' + esc(id) + '">' + esc(id) + '</option>').join('');
     sel.value = ids.includes(TC_DEFAULT_MODEL) ? TC_DEFAULT_MODEL : ids[0];
     note.textContent = ids.length + ' 个模型 · 来源 ' + ((d.diag || {}).path || '上游目录');
   } catch (e) {
+    if (seq !== tcModelSeq || uid !== tcUID) return;
     sel.innerHTML = '<option value="' + esc(TC_DEFAULT_MODEL) + '">' + esc(TC_DEFAULT_MODEL) + '</option>';
     note.textContent = '模型列表拉取失败（' + e.message + '），已回落默认模型';
   }
@@ -2881,6 +2911,57 @@ function renderExpiry(d) {
   $('expBox').hidden = false;
 }
 
+/* 快照版到期提醒：不查上游，直接用 /overview 已有的 credits_earliest_expiry /
+   credits_earliest_remaining（由签到与余额后台刷新写入 state.json，默认每 5 分钟
+   更新一次）。打开面板即可看到「最近哪批要过期」，成本与首页统计条相同为零。
+
+   与 renderExpiry（逐包明细版）的差异：这里只有**最早一批**的日期与数量，没有
+   后续批次、也没法算「7 天内合计」——那是 packages 接口才有的信息。因此卡片上
+   保留「检查」按钮作为增强入口，用户想要完整明细再显式触发一次上游查询。 */
+function renderExpirySnapshot(d) {
+  const list = (d && d.accounts) || [];
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const keyed = list.map(a => {
+    // 后端给的是 RFC3339 带时区；无到期信息（长期包/未刷新）的账号排在最后。
+    let key = null, ms = 0;
+    if (a.credits_earliest_expiry) {
+      const t = new Date(a.credits_earliest_expiry);
+      if (!isNaN(t.getTime())) { ms = t.getTime(); key = ms; }
+    }
+    return { a, key, ms };
+  });
+  keyed.sort((x, y) => {
+    if (x.key === null && y.key === null) return 0;
+    if (x.key === null) return 1;
+    if (y.key === null) return -1;
+    return x.key - y.key;
+  });
+  const rows = keyed.map(({ a, ms }) => {
+    const nm = esc(a.nickname || String(a.uid || '').slice(0, 8));
+    if (!ms || !a.credits_earliest_remaining) {
+      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+        '<span class="exp-nm">' + nm + '</span>' +
+        '<span class="exp-main">无近期到期批次</span></div>';
+    }
+    const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
+    const remain = Number(a.credits_earliest_remaining || 0);
+    const daily = Math.ceil(remain / Math.max(1, days));
+    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
+    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const when = new Date(ms).toISOString().slice(0, 10);
+    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
+      '<span class="exp-nm">' + nm + '</span>' +
+      '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
+      '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
+      fmtTok(daily) + '</b>' +
+      '<div class="note">仅最早一批，点「检查」看全部到期批次</div>' +
+      '</span></div>';
+  }).join('');
+  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
+  $('expNote').textContent = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
+  $('expBox').hidden = false;
+}
+
 // loadExpiry 加载到期卡片数据：EXP_FRESH_MS 内复用「积分构成」的同一份缓存
 // （逐账号实时查上游，能省一次是一次）；force = 用户点「检查」强制刷新。
 async function loadExpiry(force) {
@@ -3016,14 +3097,6 @@ async function downloadCredentials(path, filename) {
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     throw new Error(error.error || ('HTTP ' + response.status));
-  }
-  if (window.Wb2Api && typeof window.Wb2Api.saveJson === 'function') {
-    const text = await response.text();
-    if (!window.Wb2Api.saveJson(filename, text)) {
-      throw new Error('无法保存文件');
-    }
-    toast('凭证已导出，可直接重新导入；请妥善保存文件', 'ok');
-    return;
   }
   const blob = await response.blob();
   const url = URL.createObjectURL(blob), link = document.createElement('a');

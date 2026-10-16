@@ -68,6 +68,7 @@ type CooldownProbeResult struct {
 	Failed int `json:"failed"`
 	// SkippedInflight 因账号在途名额占满而跳过的目标数（不与用户请求抢配额）。
 	SkippedInflight int `json:"skipped_inflight,omitempty"`
+	SkippedRealm    int `json:"skipped_realm,omitempty"`
 	// Skipped 重入锁被占（已有巡检在执行），本轮整体跳过。
 	Skipped bool `json:"skipped,omitempty"`
 }
@@ -185,6 +186,10 @@ func (s *Scheduler) runCooldownProbe(ctx context.Context) CooldownProbeResult {
 		}
 		first = false
 		outcome, modelCleared, accountCleared := s.probeOne(ctx, t)
+		if outcome == probeOutcomeSkippedRealm {
+			res.SkippedRealm++
+			continue
+		}
 		if outcome == probeOutcomeSkippedInflight {
 			// 在途占满：没发请求，不计入 Probed（Probed 的口径是"实际发出的探活请求数"）。
 			res.SkippedInflight++
@@ -222,6 +227,7 @@ const (
 	// probeOutcomeSkippedInflight 账号在途名额占满：本轮不探（不与用户请求抢配额），
 	// 且**不计入 Probed**——Probed 的口径是"实际发出的探活请求数"。
 	probeOutcomeSkippedInflight
+	probeOutcomeSkippedRealm
 )
 
 // probeOne 对单个 (账号, 模型) 目标发一次最小探活请求，返回
@@ -239,6 +245,9 @@ func (s *Scheduler) probeOne(ctx context.Context, t pool.CooldownProbeTarget) (p
 	a := s.cfg.Pool.AuthByUID(t.UID)
 	if a == nil {
 		return probeOutcomeFailed, false, false
+	}
+	if owner := s.cfg.Upstream.ExclusiveModelRealm(t.Model); owner != "" && a.Realm() != owner {
+		return probeOutcomeSkippedRealm, false, false
 	}
 	if !s.cfg.Pool.Acquire(t.UID) {
 		// 在途占满：本轮不探（不与用户请求抢名额），下轮再试。

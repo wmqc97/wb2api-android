@@ -672,20 +672,17 @@ func TestWriteDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// key 形如 sk-<24字符随机串>，两次生成不重复
-	if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
-		t.Errorf("key=%q want sk-<random>", key)
+	// 默认不开启鉴权：生成的 api_key 为空，面板/接口直接打开即可用，无需先粘贴密钥。
+	if key != "" {
+		t.Errorf("key=%q want empty（默认不开启鉴权）", key)
 	}
-	if key2, _ := WriteDefault(filepath.Join(dir, "another.json")); key2 == key {
-		t.Errorf("two generated keys identical: %q", key)
-	}
-	// 落盘文件可被 Load 正常加载，推荐值齐备且 api_key 生效
+	// 落盘文件可被 Load 正常加载，推荐值齐备
 	c, err := Load(fp)
 	if err != nil {
 		t.Fatalf("load generated config: %v", err)
 	}
-	if c.APIKey != key {
-		t.Errorf("api_key=%q want %q", c.APIKey, key)
+	if c.APIKey != "" {
+		t.Errorf("api_key=%q want empty", c.APIKey)
 	}
 	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
 		t.Errorf("generated defaults off: %+v", c)
@@ -1123,8 +1120,8 @@ func TestZeroWidthSanitizeDefaultOffAndEnvOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteDefault: %v", err)
 	}
-	if key == "" {
-		t.Error("应生成随机 api_key")
+	if key != "" {
+		t.Errorf("key=%q want empty（默认不开启鉴权）", key)
 	}
 	// 生成的配置文件必须显式含该键且为 false —— 让用户能看见并直接改。
 	raw, err := os.ReadFile(path)

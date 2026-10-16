@@ -18,6 +18,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -181,6 +182,7 @@ func (c *Client) FetchGlobalModelInfos(a *auth.Auth) []ModelInfo {
 // storeGlobalModels 落缓存并返回目录（成功路径的公共尾巴：写 models/credits/fetched、
 // 清负缓存）。credits 为 nil 时清空旁表（v3 兜底路径无探测倍率）。
 func (c *Client) storeGlobalModels(merged []ModelInfo, credits map[string]string) []ModelInfo {
+	c.recordModelCatalog("global", merged)
 	c.globalModels.Lock()
 	c.globalModels.models = merged
 	c.globalModels.credits = credits
@@ -404,6 +406,10 @@ func (c *Client) desktopProbeUA() string {
 // 补充源**（catalog.go 的 MergeCatalogOverlay）。效果一致（v3 独有的可调用模型同样
 // 进目录），但不改动「探测失败回落静态名单」的既有降级链。
 func (c *Client) probeGlobalV3Capabilities(a *auth.Auth) (map[string]ModelInfo, bool) {
+	return c.probeGlobalV3CapabilitiesContext(context.Background(), a)
+}
+
+func (c *Client) probeGlobalV3CapabilitiesContext(ctx context.Context, a *auth.Auth) (map[string]ModelInfo, bool) {
 	type v3Result struct {
 		models map[string]ModelInfo
 		err    error
@@ -411,7 +417,7 @@ func (c *Client) probeGlobalV3Capabilities(a *auth.Auth) (map[string]ModelInfo, 
 	probe := func(ua string) chan v3Result {
 		ch := make(chan v3Result, 1)
 		go func() {
-			m, err := c.fetchV3ConfigModelMap(a, ua)
+			m, err := c.fetchV3ConfigModelMapContext(ctx, a, ua)
 			ch <- v3Result{models: m, err: err}
 		}()
 		return ch
