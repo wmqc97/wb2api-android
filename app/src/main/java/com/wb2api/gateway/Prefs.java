@@ -13,6 +13,7 @@ final class Prefs {
     private static final String K_PORT = "port";
     private static final String K_LAN = "lan";
     private static final String K_AUTO_START = "auto_start";
+    private static final String K_NOTIFY = "notify";
 
     private Prefs() {
     }
@@ -45,5 +46,20 @@ final class Prefs {
 
     static void setAutoStart(Context c, boolean v) {
         of(c).edit().putBoolean(K_AUTO_START, v).apply();
+    }
+
+    /**
+     * 是否显示网关的常驻状态通知（缺省 true）。
+     *
+     * 关掉只是不打扰用户，**不影响**前台服务保活：前台服务被要求必须配一条通知，
+     * 关掉开关时改用到低优先级、不可见文案的占位通知维持进程优先级，
+     * 否则网关会被系统当普通后台服务回收。
+     */
+    static boolean notify(Context c) {
+        return of(c).getBoolean(K_NOTIFY, true);
+    }
+
+    static void setNotify(Context c, boolean v) {
+        of(c).edit().putBoolean(K_NOTIFY, v).apply();
     }
 }

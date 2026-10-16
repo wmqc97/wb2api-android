@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 模型与档位：滑杆式图标，表示模型能力/思考档位配置。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="@color/ink">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M4,5h16v2H4zM10,3h2v6h-2zM4,11h16v2H4zM6,9h2v6H6zM4,17h16v2H4zM15,15h2v6h-2z" />
+</vector>

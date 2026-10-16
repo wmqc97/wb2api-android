@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 任务闭环：清单 + 播放角标，表示"加号后跑完所有待办"。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="@color/accent">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M3,5h2v2H3V5zM3,11h2v2H3V11zM3,17h2v2H3V17zM7,6h13v1.5H7zM7,11.5h13V13H7zM7,17h9v1.5H7z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M16.5,15.5l4.5,2.6 -4.5,2.6z" />
+</vector>

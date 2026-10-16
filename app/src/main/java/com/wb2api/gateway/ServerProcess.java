@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.util.Log;
 
+import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -46,6 +47,18 @@ final class ServerProcess {
     private static Thread stdioThread;
     private static Thread reaperThread;
     private static volatile String exitNote = "";
+
+    /**
+     * 进程「代际」计数：每次 start() 自增，reaper 只准写属于自己这一代的 exitNote。
+     *
+     * 为什么需要：destroy() 发的 SIGTERM 会让旧 reaper 线程立刻从 waitFor() 返回，
+     * 而重启路径的动作顺序是 shutdown() → start()。旧 reaper 的写入若晚于新 start()
+     * 清空 exitNote，就会把「上一个进程正常退出」的死信息留在字段里，waitReady() 见到
+     * 非空 exitNote 就判定本次启动失败——于是每次重启都有概率假报启动失败并触发退避重试。
+     * 加代际号后旧 reaper 的写入直接被丢弃，只有真正死于本次启动的进程才写得了 exitNote。
+     */
+    private static long generation = 0;
+    private static long exitGeneration = -1;
 
     private ServerProcess() {
     }
@@ -204,12 +217,15 @@ final class ServerProcess {
             env.put("ANDROID_DATA", "/data");
         }
 
+        // 先占代际再清空：这样晚醒的旧 reaper 会因代际不符而丢弃写入（见 generation 注释）。
+        final long myGen = ++generation;
         exitNote = "";
+        exitGeneration = myGen;
         Log.i(TAG, "启动 " + bin + " (port=" + port + ", lan=" + lan + ", TZ=" + env.get("TZ") + ")");
         Process p = pb.start();
         process = p;
         startStdioPump(app, p);
-        startReaper(p);
+        startReaper(p, myGen);
     }
 
     private static void startStdioPump(final Context app, final Process p) {
@@ -233,14 +249,18 @@ final class ServerProcess {
         stdioThread = t;
     }
 
-    private static void startReaper(final Process p) {
+    private static void startReaper(final Process p, final long gen) {
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
                     int code = p.waitFor();
-                    exitNote = "网关进程退出，code=" + code
-                            + (LogRing.tail(6).isEmpty() ? "" : "\n" + LogRing.tail(6));
+                    if (gen == exitGeneration) {
+                        // 只有「当前这一代」进程的死讯才写 exitNote，重启时旧进程的
+                        // 迟到死讯一律丢弃，否则 waitReady 会把重启误判成启动失败。
+                        exitNote = "网关进程退出，code=" + code
+                                + (LogRing.tail(6).isEmpty() ? "" : "\n" + LogRing.tail(6));
+                    }
                     Log.i(TAG, "进程退出 code=" + code);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -291,6 +311,39 @@ final class ServerProcess {
             Log.w(TAG, "读取 api_key 失败", e);
             return "";
         }
+    }
+
+    /**
+     * 把 api_key 写进 config.json；key 为空串 = 完全关闭鉴权。
+     *
+     * api_key 是服务端启动时读进内存的（config.json → Load()），所以改完之后必须重启网关
+     * 才生效，调用方负责触发重启，这里只负责落盘。
+     * 落盘失败会抛 IOException 让调用方提示用户，不静默吞掉——"改了 key 却没生效"是最难查的一类问题。
+     */
+    static void writeApiKey(Context c, String key) throws IOException, JSONException {
+        File f = configFile(c);
+        if (!f.isFile()) {
+            // 首启前服务端还没生成配置：这里给不存在的配置塞 key 会和 WriteDefault 打架，
+            // 交给启动流程先生成配置再说。
+            throw new IOException("配置文件尚未生成，请先启动一次网关");
+        }
+        String trimmed = key == null ? "" : key.trim();
+        JSONObject o = new JSONObject(readText(f));
+        o.put("api_key", trimmed);
+        byte[] raw = o.toString(2).getBytes(StandardCharsets.UTF_8);
+        // 同 syncConfigListen：先写临时文件再换名，避免面板/服务端读到半截 JSON。
+        File tmp = new File(f.getParentFile(), "config.json.tmp");
+        try (OutputStream out = new FileOutputStream(tmp)) {
+            out.write(raw);
+        }
+        if (!tmp.renameTo(f)) {
+            try (OutputStream out = new FileOutputStream(f)) {
+                out.write(raw);
+            }
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+        }
+        Log.i(TAG, "api_key 已更新（len=" + trimmed.length() + "，重启后生效）");
     }
 
     static void syncConfigListen(Context c, int port, boolean lan) {

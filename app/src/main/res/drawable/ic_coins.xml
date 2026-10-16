@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 积分明细：堆叠硬币。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="@color/accent">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M5.5,2h13c0.83,0 1.5,0.67 1.5,1.5v2c0,0.83 -0.67,1.5 -1.5,1.5h-13c-0.83,0 -1.5,-0.67 -1.5,-1.5v-2C4,2.67 4.67,2 5.5,2z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M5.5,9.5h13c0.83,0 1.5,0.67 1.5,1.5v2c0,0.83 -0.67,1.5 -1.5,1.5h-13c-0.83,0 -1.5,-0.67 -1.5,-1.5v-2c0,-0.83 0.67,-1.5 1.5,-1.5z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M5.5,17h13c0.83,0 1.5,0.67 1.5,1.5v2c0,0.83 -0.67,1.5 -1.5,1.5h-13c-0.83,0 -1.5,-0.67 -1.5,-1.5v-2c0,-0.83 0.67,-1.5 1.5,-1.5z" />
+</vector>

@@ -10,4 +10,10 @@
     <color name="ok">#147A55</color>
     <color name="warn">#A85B00</color>
     <color name="bad">#C03535</color>
+    <!-- 首页卡片配色：页面底白、卡片浅灰、状态卡浅蓝紫、停止键红。 -->
+    <color name="card">#EDEFF6</color>
+    <color name="card_accent">#E5E9FA</color>
+    <color name="model_free_bg">#EAF7F1</color>
+    <color name="field_stroke">#5A6478</color>
+    <color name="stop_red">#C0392B</color>
 </resources>

@@ -20,6 +20,9 @@ android {
         targetSdk = 35
         versionCode = 2
         versionName = "1.9.41"
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     signingConfigs {

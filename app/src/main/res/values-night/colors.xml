@@ -10,4 +10,10 @@
     <color name="ok">#3DDC97</color>
     <color name="warn">#F5B544</color>
     <color name="bad">#F0655F</color>
+    <!-- 首页卡片配色（深色）。 -->
+    <color name="card">#191D28</color>
+    <color name="card_accent">#202A4A</color>
+    <color name="model_free_bg">#143027</color>
+    <color name="field_stroke">#5A6478</color>
+    <color name="stop_red">#B23A2C</color>
 </resources>
