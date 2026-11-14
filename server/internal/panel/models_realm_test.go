@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -134,8 +135,10 @@ func TestPanelModelsGlobalRealmUsesV2Path(t *testing.T) {
 	if !ok {
 		t.Fatalf("缺 qwen-3-max，实际 ids=%v", got.Models)
 	}
-	if n := got.Models[qIdx].Name; n != "Qwen 3 Max" {
-		t.Errorf("qwen 展示名=%q want %q（不应带冗余厂商标注）", n, "Qwen 3 Max")
+	// 展示名 = 「去掉冗余厂商标注的上游名」 + 「 · ×倍率」（参考实现 format_entries 口径）。
+	wantQwen := "Qwen 3 Max · ×0.11"
+	if n := got.Models[qIdx].Name; !strings.HasPrefix(n, "Qwen 3 Max") || !strings.Contains(n, "· ×0.11") {
+		t.Errorf("qwen 展示名=%q want %q（去掉冗余厂商 + 拼倍率）", n, wantQwen)
 	}
 
 	// 写死条目：上游**没返回** deepseek-v4.1-flash，它仍必须出现在面板里，且带写死的能力快照。
@@ -144,8 +147,9 @@ func TestPanelModelsGlobalRealmUsesV2Path(t *testing.T) {
 		t.Fatalf("缺 deepseek-v4.1-flash（写死条目未生效），实际 ids=%v", got.Models)
 	}
 	ds := got.Models[dsIdx]
-	if ds.Name != "Deepseek-V4.1-Flash" {
-		t.Errorf("deepseek name=%q want Deepseek-V4.1-Flash", ds.Name)
+	wantDS := "Deepseek-V4.1-Flash · ×0.00"
+	if !strings.HasPrefix(ds.Name, "Deepseek-V4.1-Flash") || !strings.Contains(ds.Name, "· ×0.00") {
+		t.Errorf("deepseek name=%q want %q", ds.Name, wantDS)
 	}
 	if ds.Credits != "x0.00" {
 		t.Errorf("deepseek credits=%q want x0.00（写死条目快照，实测 v3-CLI 原值）", ds.Credits)

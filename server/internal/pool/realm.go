@@ -74,3 +74,23 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.sortByOrderLocked(uids)
 	return uids
 }
+
+// HasUsableRealm 报告该域是否存在**可用**账号（未禁用、未临时停用）。
+//
+// 与 HasRealm 的分工：HasRealm 只回答「有没有这个域的账号」，用于路由/列表口径；
+// 本方法回答「这个域现在有没有能干活的人」，用于面板默认域这类**交互**决策——
+// 按 HasRealm 判会出现「global 账号全被停用/烧光，打开模型页直接报错」的体验，
+// 而用户其实只想看 CN 的模型列表。
+func (p *Pool) HasUsableRealm(realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, e := range p.byUID {
+		if e.disabled || e.manualDisabled {
+			continue
+		}
+		if e.a.Realm() == realm {
+			return true
+		}
+	}
+	return false
+}

@@ -17,12 +17,33 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
+// PanelRequireAuth 面板是否需要 api_key 鉴权（缺省 true；只影响 /panel/*）。
+//
+// 用 *bool 而不是 bool：既要区分「没写这个键」（= 需要密码，既有行为）与
+// 「显式写了 false」（= 免密），也要让旧 config.json 在升级后行为不变。
+func (c *Config) PanelRequireAuth() bool {
+	if c.Panel.RequireAuth == nil {
+		return true
+	}
+	return *c.Panel.RequireAuth
+}
+
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// Panel 网页面板的访问控制（App「设置 → 网页面板访问密码」开关的落点）。
+	//
+	// 语义边界（重要）：**只影响 /panel/***，不碰 /v1/*（客户端调用仍按 api_key 鉴权）。
+	// 关闭鉴权后同一网络内任何设备打开 http://IP:PORT/panel/ 都能直接操作账号池——
+	// 这是用户显式选择的便利性取舍，App 设置里带醒目警告。
+	Panel struct {
+		// RequireAuth 面板是否要求 api_key。缺省（nil）= true，保持既有行为。
+		RequireAuth *bool `json:"require_auth,omitempty"`
+	} `json:"panel"`
 
 	Server struct {
 		// MaxBodyMB 聊天请求体大小上限（单位 MB，**默认 0 = 不预拦截**，吸收上游 73fe1f8）。

@@ -9,6 +9,11 @@
 // 写死条目只在**缺失**时兜底（MergePinned）。
 package upstream
 
+import (
+	"strings"
+	"sync/atomic"
+)
+
 // PinnedModel 强制内置的模型条目。字段与 /v1/models 的输出一一对应，
 // 同时充当 config 里 models.pinned_models 的元素类型。
 type PinnedModel struct {
@@ -92,8 +97,19 @@ func (p PinnedModel) Info() ModelInfo {
 // 关键取舍：SupportedEfforts 为空时**不输出该键**，面板据此渲染成"固定档 · 默认 X"
 // （空数组与"不可选"是同一语义，输出空数组会让前端多一次无意义的判断）。
 func (p PinnedModel) Entry() map[string]any {
+	// id 拼倍率展示后缀（与 server 侧 priceSuffix 同口径，分隔符固定 "|×"）：
+	// 只读 id 的客户端也能看到倍率；网关入站时统一剥离。
+	id := p.ID
+	if IDPriceSuffix() {
+		if c := strings.TrimSpace(p.Credits); c != "" {
+			c = strings.TrimPrefix(strings.TrimPrefix(c, "x"), "X")
+			if c != "" {
+				id += "|×" + c
+			}
+		}
+	}
 	e := map[string]any{
-		"id":       p.ID,
+		"id":       id,
 		"object":   "model",
 		"created":  1753600000,
 		"owned_by": "workbuddy",
@@ -109,6 +125,10 @@ func (p PinnedModel) Entry() map[string]any {
 	}
 	if p.Credits != "" {
 		e["credits"] = p.Credits
+	}
+	// name 与 modelEntry 同口径：写死条目也要能显示倍率（外部调用看的是 name）。
+	if name := pinnedDisplayName(p.ID, p.Credits, p.SupportsImages); name != "" {
+		e["name"] = name
 	}
 	if p.DefaultEffort != "" {
 		e["default_effort"] = p.DefaultEffort
@@ -187,3 +207,37 @@ func MergePinned(in []ModelInfo, pinned []PinnedModel) []ModelInfo {
 	}
 	return out
 }
+
+// pinnedDisplayName 写死条目的展示名：<id> · ×<倍率>（无倍率则裸名）。
+//
+// 与 server.modelDisplayName 同一口径。这里没有复用那个函数，是因为包依赖方向
+// 只能是 server → upstream（让 upstream 反向 import server 会成环）。
+func pinnedDisplayName(id, credits string, images bool) string {
+	id = strings.TrimSpace(id)
+	c := strings.TrimSpace(credits)
+	c = strings.TrimPrefix(strings.TrimPrefix(c, "x"), "X")
+	if id == "" {
+		return ""
+	}
+	out := id
+	// 没给倍率就不拼（不显示「未知」占位）。
+	if c != "" {
+		out += " · ×" + c
+	}
+	if images {
+		out += " · 可传图"
+	}
+	return out
+}
+
+// idPriceSuffix 与 server 侧同名的开关联动：/v1/models 的 id 是否拼「|×倍率」
+// 展示后缀。写死条目（PinnedModel.Entry）也要跟着变，否则同一份列表里两种 id 形态。
+var idPriceSuffix atomic.Bool
+
+func init() { idPriceSuffix.Store(false) }
+
+// SetIDPriceSuffix 注入开关（server 包在启动/热改配置时调用，保持两侧一致）。
+func SetIDPriceSuffix(on bool) { idPriceSuffix.Store(on) }
+
+// IDPriceSuffix 报告当前开关状态。
+func IDPriceSuffix() bool { return idPriceSuffix.Load() }

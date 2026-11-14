@@ -80,6 +80,74 @@ func (p *Pool) PickExcludingForRealmMeta(tried map[string]bool, realm string) *a
 	return p.pickWith(tried, "", realm, false, true)
 }
 
+// PickForCatalog 元数据（模型目录 / 价格展示）专用选号：**允许**选中正在硬冷却
+// （余额耗尽）的账号。
+//
+// 为什么必须开这个口子：模型目录是只读接口，不消费任何积分，余额为 0 的号照样能
+// 返回目录。若沿用 chat 的选号谓词（CoolHard 一律排除），一旦某个域的账号全部烧光
+// 余额（典型：纯 global 池的两个号 credits=0 处于硬冷却），面板「模型与档位」就会
+// 报「没有可用的 global 账号」——恰恰是用户最需要看清「还剩什么模型、多少钱」的时刻。
+//
+// 优先级（同级内按余额降序、UID 升序，保证结果稳定可解释）：
+//  1. 该域的 healthy 账号（正常情况下第 1 段就命中，与既有行为一致）；
+//  2. 该域内处于冷却期（软冷却/熔断/硬冷却）的账号——只要不是被禁用/临时停用。
+//
+// 绝不返回 disabled / manualDisabled（那是运维明确的处置，不该被展示路径绕过）。
+// 只按 realm 精确过滤：跨域借号会拉到另一个域的目录（modelsPaths 按账号 realm 选路），
+// 展示结果会串域，比报错更糟。
+func (p *Pool) PickForCatalog(realm string) *auth.Auth {
+	return p.pickCatalog(realm, false)
+}
+
+// PickForCatalogAny 同 PickForCatalog，但连**禁用/临时停用**的账号也借。
+//
+// 何时该用它：只读的目录探测要多拿一份数据（倍率/窗口/能力）时——账号被停用通常
+// 是"流量不想要它了"，不代表它的 token 不能读目录。拉目录失败没有任何副作用
+// （不扣积分、不改状态），所以这里放宽到"池里还有谁就试谁"，拿不到再回落静态表。
+//
+// 只用于元数据探测；聊天/签到等一切会花积分或写状态的路径都不许用。
+func (p *Pool) PickForCatalogAny(realm string) *auth.Auth {
+	return p.pickCatalog(realm, true)
+}
+
+func (p *Pool) pickCatalog(realm string, includeDisabled bool) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	var best *entry
+	bestRank := 99
+	for uid, e := range p.byUID {
+		if !includeDisabled && (e.disabled || e.manualDisabled) {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		rank := 1 // 冷却中（含余额耗尽的硬冷却）
+		if e.healthy(now) {
+			rank = 0
+		}
+		if rank > bestRank {
+			continue
+		}
+		if rank == bestRank && best != nil {
+			if e.credits < best.credits {
+				continue
+			}
+			if e.credits == best.credits && uid > best.a.UID {
+				continue
+			}
+		}
+		best, bestRank = e, rank
+	}
+	if best == nil {
+		return nil
+	}
+	log.Printf("pool: catalog_pick uid=%s realm=%s rank=%d credits=%d（元数据查询：允许用冷却号）",
+		best.a.UID, realm, bestRank, best.credits)
+	return best.a
+}
+
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）；realmFallback=true 时
@@ -365,6 +433,30 @@ func (p *Pool) pickWeightedHealthyLocked(tried map[string]bool, now time.Time, r
 		// 另一域健康时仍打在注定失败的冷却号上）。
 		return nil
 	}
+	// 到期紧迫度：所有策略的**首要**排序依据（参考实现 pool.expiry_key）。
+	//
+	// 为什么是"先分组再加权"而不是"再加一个权重项"：权重是概率倾斜 —— 一个 7 天内
+	// 到期的号只是「更容易」被选中；只要池里还有余额更高或更闲置的号，抽签就可能
+	// 一直不选它，直到那批额度作废（用户原话：「还是优先把快到期的账号积分先用完」）。
+	// 因此这里只保留**最紧迫那一档**的候选，组内仍走原三因子加权 Top5 + 抽签 ——
+	// 「严格优先」与「打散热点」两者同时成立。
+	//
+	// 零回归：没有任何到期信息时全体 rank=2，过滤是恒等操作，行为与改动前逐字节一致。
+	best := 2
+	for _, e := range cands {
+		if r := e.expiryRank(); r < best {
+			best = r
+		}
+	}
+	if best < 2 {
+		kept := cands[:0]
+		for _, e := range cands {
+			if e.expiryRank() == best {
+				kept = append(kept, e)
+			}
+		}
+		cands = kept
+	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
 	var maxCredits int64
@@ -600,6 +692,27 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 }
 
 // SetCredits 更新账号余额。
+
+// expiryRank 到期紧迫度分级（**越小越先被选中**），口径与参考实现
+// admin/credits.urgency_rank / pool.expiry_key 完全一致：
+//
+//	0 —— 有快过期窗口内的剩余额度（不烧就作废，最紧急）
+//	1 —— 有明确到期时间但还早（自然形成"离到期近的先走"）
+//	2 —— 长期有效（没有作废风险，只用它兜底）
+//
+// 数据来源是 creditsExpiring / creditsExpiringAt（由签到/余额刷新按上游
+// ResourceDiag 同步写入）。缺数据（老 state、从未刷新过）→ rank 2：
+// 把未知当成"没有作废风险"，最坏只是晚点用它；反过来把未知当成"快过期"，
+// 会让调度去烧一个根本不紧急的号，耽误真正快作废的额度。调用方需已持 p.mu。
+func (e *entry) expiryRank() int {
+	if e.creditsExpiring > 0 {
+		return 0
+	}
+	if !e.creditsExpiringAt.IsZero() {
+		return 1
+	}
+	return 2
+}
 
 // expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
 // 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，

@@ -492,13 +492,20 @@ func TestCatalogAppendRespectsAgentsWhitelist(t *testing.T) {
 	for _, mi := range infos {
 		ids[mi.ID] = true
 	}
-	if !ids["keep"] {
-		t.Errorf("白名单内的 keep 应保留: %v", ids)
-	}
-	for _, id := range []string{"blocked-a", "blocked-b"} {
-		if ids[id] {
-			t.Errorf("%s 被 agents 白名单挡掉，追加步不得把它放回来: %v", id, ids)
+	// 新口径（对齐参考项目）：agents 名单只用于排序，models 全表都进目录，
+	// 不再把 blocked-a/b 这类「CLI 快捷名单外」的条目丢掉（实测它们能正常调用）。
+	for _, id := range []string{"keep", "blocked-a", "blocked-b", "v3-only"} {
+		if !ids[id] {
+			t.Errorf("全表条目 %s 缺失: %v", id, ids)
 		}
+	}
+	// 名单内的 keep 应排在被挡条目之前（稳定排序，不打乱其余顺序）。
+	pos := map[string]int{}
+	for i, mi := range infos {
+		pos[mi.ID] = i
+	}
+	if p, ok := pos["keep"]; !ok || (pos["blocked-a"] < p) {
+		t.Errorf("agents 名单内的 keep 未排前: %v", pos)
 	}
 	if !ids["v3-only"] {
 		t.Errorf("真独有 id v3-only 应被追加: %v", ids)

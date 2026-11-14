@@ -30,7 +30,9 @@ func modelsByID(list []map[string]any) map[string]map[string]any {
 		if i := strings.LastIndex(id, ":"); i >= 0 {
 			id = id[i+1:] // 去掉 cn:/global: 前缀，测试按裸名断言
 		}
-		out[id] = m
+		// 再剥 /v1/models 的「|×倍率」展示后缀：测试断言的是**可调用的裸名**，
+		// 后缀只是给只读 id 的客户端看的展示信息（入站会剥离，见 resolve_model.go）。
+		out[stripPriceSuffix(id)] = m
 	}
 	return out
 }
@@ -271,12 +273,12 @@ func TestModelEntryOmitsUnknownContext(t *testing.T) {
 	if _, has := e["max_output_tokens"]; has {
 		t.Errorf("未知模型不应有 max_output_tokens，got %v", e["max_output_tokens"])
 	}
-	if e["id"] != "brand-new" || e["object"] != "model" || e["owned_by"] != "workbuddy" {
+	if stripPriceSuffix(e["id"].(string)) != "brand-new" || e["object"] != "model" || e["owned_by"] != "workbuddy" {
 		t.Errorf("基础字段=%v", e)
 	}
 	e = modelEntry("global:", upstream.ModelInfo{ID: "glm-5.2", ContextWindow: 500, MaxTokens: 100})
-	if e["id"] != "global:glm-5.2" {
-		t.Errorf("id=%v want global:glm-5.2", e["id"])
+	if stripPriceSuffix(e["id"].(string)) != "global:glm-5.2" {
+		t.Errorf("id=%v want global:glm-5.2（倍率后缀可剥离）", e["id"])
 	}
 	if e["context_length"] != int64(500) || e["max_output_tokens"] != int64(100) {
 		t.Errorf("远端值应权威透出：%v/%v", e["context_length"], e["max_output_tokens"])

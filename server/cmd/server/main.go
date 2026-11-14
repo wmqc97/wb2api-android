@@ -285,6 +285,7 @@ func main() {
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
 	live := livecfg.New(livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		PanelAuthDisabled:    !cfg.PanelRequireAuth(),
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		DeepseekSGFallback:   cfg.Pool.DeepseekSGFallback,
@@ -341,8 +342,9 @@ func main() {
 		PinnedModels: pinnedModels,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
-		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
-		ConfigPath: *cfgPath,
+		ProbeFile:       stateSibling(cfg.StateFile, "output_probes.json"),
+		GrowthStateFile: cfg.StateFile,
+		ConfigPath:      *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -392,6 +394,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// 定时任务管理面板：15 秒扫描 data/schedules.json，到点触发既有任务入口。
+	// 默认任务里含「WorkBuddy 成长计划巡检」（每 60 分钟），故不再另起一条
+	// 成长计划循环——用户禁用/删除该任务即真正停掉自动巡检。
+	pn.StartSchedules(ctx)
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	// auths 目录热加载：每 AuthWatchInterval 扫一轮，把手工上传/删除的 auth 文件对齐进池。
@@ -663,6 +669,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
+		PanelAuthDisabled:    !newCfg.PanelRequireAuth(),
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,

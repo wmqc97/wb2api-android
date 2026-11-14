@@ -78,7 +78,7 @@ func TestModelListStaysCreditsFree(t *testing.T) {
 	byID := make(map[string]map[string]any, len(list))
 	for _, e := range list {
 		if id, _ := e["id"].(string); id != "" {
-			byID[id] = e
+			byID[stripPriceSuffix(id)] = e
 		}
 	}
 	// global 条目：倍率不进该路径（含 hy3——两域都有，precedence=global 保留 global 那份）。

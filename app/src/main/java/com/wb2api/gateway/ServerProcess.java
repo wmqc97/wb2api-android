@@ -346,6 +346,64 @@ final class ServerProcess {
         Log.i(TAG, "api_key 已更新（len=" + trimmed.length() + "，重启后生效）");
     }
 
+    /**
+     * 面板是否要求 api_key（config.json 的 panel.require_auth）。
+     *
+     * 缺省 true：老配置里没有这个键时行为不变（面板要密码）。只影响 /panel/*，
+     * 不碰 /v1/* 的鉴权。
+     */
+    static boolean readPanelRequireAuth(Context c) {
+        try {
+            File f = configFile(c);
+            if (!f.isFile()) {
+                return true;
+            }
+            JSONObject o = new JSONObject(readText(f));
+            JSONObject panel = o.optJSONObject("panel");
+            if (panel == null || !panel.has("require_auth")) {
+                return true;
+            }
+            return panel.optBoolean("require_auth", true);
+        } catch (Exception e) {
+            Log.w(TAG, "读取 panel.require_auth 失败", e);
+            return true;
+        }
+    }
+
+    /**
+     * 写 config.json 的 panel.require_auth（重启后生效，web 侧的 Live 快照随之更新）。
+     *
+     * 语义边界：只关面板密码（/panel/*），/v1/* 仍按 api_key 鉴权——不做"顺手把 API
+     * 也变成无鉴权"这种事。落盘失败抛异常由调用方提示，不静默吞。
+     */
+    static void writePanelRequireAuth(Context c, boolean requireAuth) throws IOException, JSONException {
+        File f = configFile(c);
+        if (!f.isFile()) {
+            throw new IOException("配置文件尚未生成，请先启动一次网关");
+        }
+        JSONObject o = new JSONObject(readText(f));
+        JSONObject panel = o.optJSONObject("panel");
+        if (panel == null) {
+            panel = new JSONObject();
+        }
+        panel.put("require_auth", requireAuth);
+        o.put("panel", panel);
+        byte[] raw = o.toString(2).getBytes(StandardCharsets.UTF_8);
+        // 同 syncConfigListen：先写临时文件再换名，避免服务端读到半截 JSON。
+        File tmp = new File(f.getParentFile(), "config.json.tmp");
+        try (OutputStream out = new FileOutputStream(tmp)) {
+            out.write(raw);
+        }
+        if (!tmp.renameTo(f)) {
+            try (OutputStream out = new FileOutputStream(f)) {
+                out.write(raw);
+            }
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+        }
+        Log.i(TAG, "panel.require_auth=" + requireAuth + "（重启后生效）");
+    }
+
     static void syncConfigListen(Context c, int port, boolean lan) {
         File f = configFile(c);
         if (!f.isFile()) {

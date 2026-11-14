@@ -204,7 +204,7 @@ func TestModelListGlobalOnlyNoPrefix(t *testing.T) {
 		if strings.Contains(id, ":") {
 			t.Fatalf("id=%q 仍带域前缀（strip_realm_prefix=true 应为裸名）", id)
 		}
-		ids[id] = true
+		ids[stripPriceSuffix(id)] = true
 	}
 	if ids["default-model"] {
 		t.Fatal("default-model 是上游路由别名，默认应被 hidden_models 隐藏")

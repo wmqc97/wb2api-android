@@ -2,7 +2,9 @@
 //
 // 资源经 go:embed 打进二进制（随服务部署，无外部构建步骤）：
 //   - index.html  页面骨架
-//   - app.js      全部前端逻辑（独立文件而非内联，为了启用无需 unsafe-inline 的严格 CSP）
+//   - app.js           面板主逻辑
+//   - growth_center.js 成长计划页逻辑（独立文件，严格 CSP 下同样无需 unsafe-inline）
+//   - growth_center.css 成长计划页样式
 //
 // 安全头对"面板页面与全部 /panel/api/* 响应"统一生效：CSP 限制脚本只能来自本服务，
 // 禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，并声明不泄露 Referer 出去。
@@ -19,19 +21,28 @@ var indexHTML []byte
 //go:embed app.js
 var appJS []byte
 
+//go:embed growth_center.css
+var growthCenterCSS []byte
+
+//go:embed growth_center.js
+var growthCenterJS []byte
+
+//go:embed schedules.js
+var schedulesJS []byte
+
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
-//   - script-src 'self'         只跑同源脚本（app.js）；页面无内联事件处理器/内联脚本
+//   - script-src 'self'         只跑同源脚本（app.js / growth_center.js）；无内联脚本
 //   - style-src 'self' 'unsafe-inline'
 //     style 的内联是设计取舍：页面有少量 style="..." 属性（进度条宽度、表格列宽），
 //     允许内联样式不会导致脚本执行；仍禁止外部样式域与 @import 外链。
 //   - connect-src 'self'        前端 fetch 只能打本服务
-//   - img-src 'self' data:      图标/内联图
+//   - img-src 'self' data: https: 图标/内联图 + 官方 Buddy 缩略图（仅 https）
 //   - form-action 'none'        页面无表单提交目标（配置页是 JS 提交）
 //   - frame-ancestors 'none'    禁止被任何站点 iframe 嵌套（点击劫持）
 //   - base-uri 'none'          禁止注入 <base> 改写相对路径
 const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-	"connect-src 'self'; img-src 'self' data:; form-action 'none'; " +
+	"connect-src 'self'; img-src 'self' data: https:; form-action 'none'; " +
 	"frame-ancestors 'none'; base-uri 'none'"
 
 // setSecurityHeaders 写入面板统一安全响应头（页面与 API 都要，API 也含 JSON 数据）。
@@ -50,6 +61,28 @@ func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(indexHTML)
+}
+
+// growthCenterCSS / growthCenterJS 输出成长计划页独立资源（同源，严格 CSP 下可加载）。
+func (p *Panel) growthCenterCSSHandler(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(growthCenterCSS)
+}
+
+func (p *Panel) growthCenterJSHandler(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(growthCenterJS)
+}
+
+func (p *Panel) schedulesJSHandler(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(schedulesJS)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。

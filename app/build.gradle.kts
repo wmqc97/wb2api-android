@@ -12,6 +12,10 @@ if (keystorePropertiesFile.exists()) {
 
 android {
     namespace = "com.wb2api.gateway"
+    androidResources {
+        // 不压缩 Go 原生库，供 zipalign -p 16384 对齐 APK 内条目（16KB 页设备）。
+        noCompress += "lib/arm64-v8a/libwb2api.so"
+    }
     compileSdk = 35
 
     defaultConfig {

@@ -59,6 +59,16 @@
                 android:layout_height="1dp"
                 android:layout_weight="1" />
 
+            <!-- 手机号登录：直接在 App 内收码添加账号，不用跳浏览器 -->
+            <ImageButton
+                android:id="@+id/phoneLoginButton"
+                android:layout_width="46dp"
+                android:layout_height="46dp"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/action_phone_login"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_phone" />
+
             <ImageButton
                 android:id="@+id/modelTierButton"
                 android:layout_width="46dp"

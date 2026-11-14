@@ -60,6 +60,28 @@ body {
 .nav a svg { width: 15px; height: 15px; flex: none; opacity: .85; }
 .nav .sig { padding: 12px 16px; border-top: 1px solid var(--line-soft); font-size: 11.5px; color: var(--ink-3); }
 .nav .sig .row { display: flex; align-items: center; gap: 7px; }
+
+/* ── 左侧导航（对齐参考项目：桌面固定侧栏，移动端抽屉）─────────────── */
+/* 角标：7 天内到期的账号数（不展开面板也能看到有额度要作废）。 */
+.nav .dot {
+  margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  background: var(--warn-soft); color: var(--warn); font: 650 11px/18px var(--sans);
+  text-align: center; flex: none;
+}
+.nav .dot[hidden] { display: none; }
+/* 侧栏底部：主题三态 + 运行状态（设置项在导航里，主题常驻底部便于随手切）。 */
+.side-foot { border-top: 1px solid var(--line-soft); }
+.theme-set { display: flex; align-items: center; gap: 4px; padding: 10px 12px 6px; }
+.theme-set .lb { font-size: 11.5px; color: var(--ink-3); margin-right: auto; }
+.theme-set button {
+  flex: 1 1 0; min-width: 0; padding: 5px 0; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-3);
+  font: 550 11.5px var(--sans);
+}
+.theme-set button:hover { color: var(--ink); }
+.theme-set button.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.nav-toggle { display: none; }
+.nav-scrim { display: none; }
 /* 日志频道筛选 chips */
 .chips { display: inline-flex; gap: 4px; align-items: center; }
 .chips .chip { padding: 2px 10px; border-radius: 999px; }
@@ -68,6 +90,30 @@ body {
 .ln .lch.c-task { background: var(--accent-soft); color: var(--accent); }
 .ln .lch.c-chat { background: var(--ok-soft); color: var(--ok); }
 .ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
+
+/* ── 积分到期视图（按「最先作废」排序；口径与调度一致） ────────────── */
+.exp-tag { display: inline-block; padding: 1px 7px; border-radius: 5px; font: 650 11px/1.5 var(--sans); white-space: nowrap; }
+.exp-tag.soon { background: var(--warn-soft); color: var(--warn); }
+.exp-tag.dead { background: var(--bad-soft); color: var(--bad); }
+.exp-tag.ever { background: var(--surface-2); color: var(--ink-3); }
+.exp-row {
+  display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1.2fr) 88px 96px 128px;
+  gap: 10px; align-items: center; padding: 9px 0;
+  border-top: 1px solid var(--line-soft); font-size: 13px;
+}
+.exp-row:first-child { border-top: 0; }
+.exp-row .nm { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.exp-row .nm .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+.exp-row .nm .u { font: 11px var(--mono); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exp-row .pkg { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exp-row .num { font-variant-numeric: tabular-nums; text-align: right; color: var(--ink-2); white-space: nowrap; }
+.exp-row .num b { color: var(--ink); }
+.exp-row .when { text-align: right; color: var(--ink-3); font-size: 12px; white-space: nowrap; }
+.exp-empty { color: var(--ink-3); font-size: 13px; padding: 18px 0; text-align: center; }
+@media (max-width: 760px) {
+  .exp-row { grid-template-columns: minmax(0, 1fr) 84px 100px; row-gap: 4px; }
+  .exp-row .pkg, .exp-row .u { display: none; }
+}
 
 /* 任务中心 */
 .tc-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 42px 16px; color: var(--ink-3); }
@@ -380,6 +426,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
 .dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
 .tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 -20px; padding: 14px 20px 0; }
+/* 手机号登录：区号窄、号码宽；第二行验证码 + 发码按钮同行（窄屏自动换行）。 */
+.phone-row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.phone-row .phone-country { flex: 0 0 132px; width: 132px; }
+.phone-row input { flex: 1 1 160px; min-width: 0; }
+.phone-row .phone-send { flex: 0 0 auto; white-space: nowrap; }
 .url {
   background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
   padding: 11px 13px; font: 12px var(--mono); word-break: break-all; color: var(--accent);
@@ -431,8 +482,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 @media (max-width: 760px) {
   .shell { grid-template-columns: 1fr; }
-  .nav { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
-  .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
   .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
 }
   /* ── 用量视图 ───────────────────────────────────────────────── */
@@ -553,13 +602,34 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 }
 @media (max-width: 760px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
-  .nav { display: block; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }
-  .brand { padding: 14px 16px 8px; border: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .nav ul { overflow-x: auto; padding: 4px 8px 10px; flex-wrap: nowrap; }
+  /* 侧栏在移动端变成抽屉：默认移出屏幕，汉堡按钮抽出来，点遮罩/选中项收起
+     （与参考项目一致：顶部不再堆一排图标，纵向菜单可放下更多入口）。 */
+  .nav {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 264px; max-width: 82vw; height: 100%;
+    z-index: 75; transform: translateX(-100%); transition: transform .22s cubic-bezier(.2,.7,.3,1);
+    display: flex; flex-direction: column; border-right: 1px solid var(--line); border-bottom: 0;
+    overflow-y: auto;
+  }
+  .nav.open { transform: none; }
+  body.nav-open { overflow: hidden; }
+  .nav-scrim {
+    display: block; position: fixed; inset: 0; z-index: 74;
+    background: rgba(6,8,13,.5); opacity: 0; pointer-events: none; transition: opacity .2s;
+  }
+  .nav-scrim.on { opacity: 1; pointer-events: auto; }
+  .nav-toggle {
+    display: inline-flex; position: fixed; left: 10px; top: 10px; z-index: 73;
+    width: 38px; height: 38px; align-items: center; justify-content: center;
+    border: 1px solid var(--line); border-radius: 9px; background: var(--surface);
+    color: var(--ink); box-shadow: var(--shadow); cursor: pointer;
+  }
+  .nav-toggle svg { width: 18px; height: 18px; }
+  .brand { padding: 16px 18px 14px; }
+  .nav ul { display: block; overflow: visible; padding: 8px; flex: none; }
   .nav li { flex: none; }
-  .nav a { white-space: nowrap; margin: 0; padding: 9px 11px; }
-  .nav .sig { display: none; }
-  .topbar { position: static; padding: 12px 16px; flex-wrap: wrap; gap: 10px; }
+  .nav a { white-space: nowrap; margin: 0 0 2px; padding: 11px 13px; }
+  .nav .sig { display: block; }
+  .topbar { position: static; padding: 12px 16px 12px 58px; flex-wrap: wrap; gap: 10px; }
   .view { padding: 16px 12px 40px; }
   .box { margin-bottom: 16px; }
   .box > header, .box .pad, .filterbar { padding: 14px; }
@@ -621,11 +691,106 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 #dailyQuotaVeil header .grow { flex:1; }
 #dailyQuotaVeil h3 { font-size:15px; }
 @media(max-width:600px) { #dailyQuotaVeil .pad { padding:14px; } #dailyQuotaVeil header h3 { flex-basis:100%; } }
+
+/* ── 手机端布局适配（功能一行不动，只做「看得清、点得到」）────────────
+   1. 账号池那张 10 列宽表在手机上横向滚动极难用 → 每个账号变一张卡片：
+      表头隐藏，每格用 ::before 补列名（列序固定，故直接按 nth-child 定位）；
+   2. 弹窗在窄屏铺满、按钮换行，避免底部按钮被裁掉；
+   3. 其余宽表保留横向滚动，只缩小字号并开启惯性滚动，保证不撑破布局。 */
+@media (max-width: 760px) {
+  /* 账号表 → 卡片 */
+  #accTable { min-width: 0; }
+  #accTable thead { display: none; }
+  #accTable tbody tr {
+    display: block; position: relative; margin: 0 0 10px; padding: 10px 12px 8px 16px;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  }
+  #accTable tbody tr:hover { background: var(--surface); }
+  #accTable td {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 3px 0; border: 0; font-size: 12.5px; text-align: left;
+  }
+  #accTable td:empty { display: none; }
+  /* 状态色条贴卡片左缘（原表格里它是 3px 宽的列） */
+  #accTable td.mark {
+    position: absolute; left: 0; top: 8px; bottom: 8px; width: 3px; min-width: 0; padding: 0;
+  }
+  #accTable td.mark i { width: 3px; height: 100%; min-height: 0; border-radius: 2px; }
+  /* 拖拽排序在手机上不好用：隐藏手柄列（顺序仍可在桌面端调） */
+  #accTable td.drag-handle { display: none; }
+  /* 列名：顺序与表头一一对应 */
+  #accTable td::before { flex: 0 0 auto; color: var(--ink-3); font-size: 11.5px; font-weight: 500; }
+  #accTable td:nth-child(3)::before { content: "账号"; }
+  #accTable td:nth-child(4)::before { content: "状态"; }
+  #accTable td:nth-child(5)::before { content: "积分"; }
+  #accTable td:nth-child(6)::before { content: "成功 / 失败"; }
+  #accTable td:nth-child(7)::before { content: "在途 / 上限"; }
+  #accTable td:nth-child(8)::before { content: "用量"; }
+  #accTable td:nth-child(9)::before { content: "最近成功"; }
+  #accTable td:nth-child(3) { flex-direction: column; align-items: flex-start; gap: 2px; }
+  #accTable td:nth-child(3)::before { margin-bottom: 2px; }
+  #accTable td:nth-child(3) .who { max-width: 100%; min-width: 0; }
+  #accTable td:nth-child(3) .who .nm,
+  #accTable td:nth-child(3) .who .id,
+  #accTable td:nth-child(3) .who .pid { white-space: normal; overflow-wrap: anywhere; }
+  /* 操作按钮：整行铺开两列排（手机上单手可点） */
+  #accTable td:last-child {
+    display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-start;
+    margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line-soft);
+  }
+  #accTable td:last-child::before { display: none; }
+  /* 操作列：td 本身就带 .acts（每行一组按钮），要解除宽表的 230px 上限 */
+  #accTable td.acts, #accTable td:last-child { max-width: none; width: auto; }
+  #accTable td:last-child .acts { max-width: none; width: 100%; justify-content: flex-start; gap: 6px; }
+  #accTable td:last-child button { flex: 1 1 calc(50% - 6px); min-height: 34px; }
+  #view-accounts .acc .usage-cell, #view-accounts .acc .c-acts { min-width: 0; }
+
+  /* 弹窗：铺满底部（bottom sheet 手感），按钮换行 */
+  .veil.on { padding: 8px; align-items: flex-end; }
+  .dlg { width: 100% !important; max-width: 100%; max-height: 92vh; border-radius: 14px 14px 0 0; }
+  .dlg header { padding: 14px 16px 11px; }
+  .dlg .body { padding: 14px 16px; }
+  .dlg footer {
+    padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+    flex-wrap: wrap; gap: 8px;
+  }
+  .dlg footer button { flex: 1 1 auto; min-height: 38px; }
+  .dlg .tabs { margin-left: 0; margin-top: 8px; }
+  .phone-row .phone-country { flex: 1 1 120px; width: auto; }
+
+  /* 其余宽表：横向滚动 + 小字号 */
+  .tbl-wrap { -webkit-overflow-scrolling: touch; }
+  .acc { font-size: 12.5px; }
+  .acc th { font-size: 11.5px; }
+  .acc td, .acc th { padding-left: 7px; padding-right: 7px; }
+
+  /* 顶部栏与筛选栏 */
+  .topbar h2 { font-size: 15px; }
+  .topbar .meta, .topbar .sep { display: none; }
+  .topbar button { min-height: 34px; }
+  .filterbar { gap: 8px; }
+  .chips { flex-wrap: wrap; }
+  #logBox { font-size: 11.5px; padding: 12px; }
+  .savebar { position: static; }
+}
+
+/* 超窄屏（≤460px）：再省一层信息，只保留能做出判断的字段 */
+@media (max-width: 460px) {
+  #accTable td:nth-child(3) .who .id { display: none; }
+  #view-expiry .exp-row { grid-template-columns: minmax(0, 1fr) 80px; row-gap: 3px; }
+  #view-expiry .exp-row .when:nth-child(4) { display: none; }
+  .topbar .grow { display: none; }
+}
 </style>
+<link rel="stylesheet" href="growth_center.css">
 </head>
 <body>
+<!-- 移动端导航入口：与参考项目一致（汉堡按钮抽开左侧抽屉） -->
+<button class="nav-toggle" id="navToggle" aria-label="展开导航菜单" aria-expanded="false">
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.2 4.4h11.6M2.2 8h11.6M2.2 11.6h11.6"/></svg>
+</button>
 <div class="shell">
-  <nav class="nav">
+  <nav class="nav" id="nav">
     <div class="brand">
       <div class="name">WorkBuddy2API</div>
       <div class="sub" id="navSub">控制台</div>
@@ -634,6 +799,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#accounts" data-view="accounts" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
+      <li><a href="#expiry" data-view="expiry">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 1.8h8M4 14.2h8"/><path d="M5 1.8v3l6 6v3.4M11 1.8v3L5 10.8v3.4"/></svg>
+        积分到期<span class="dot" id="navExpiryDot" hidden>0</span></a></li>
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
@@ -643,21 +811,37 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
+      <li><a href="#schedules" data-view="schedules">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6"/><path d="M8 4.4V8l2.4 1.6"/></svg>
+        定时任务</a></li>
+      <li><a href="#growth" data-view="growth">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 14.5V7.5m0 4C3.5 11 2 5 3 2c3.5 0 5 1.7 5 4.5m0 5c4.5.5 6-5.5 5-9-3.5 0-5 1.7-5 4.5"/></svg>
+        成长计划</a></li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
-      <li><a href="#config" data-view="config">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
-        配置</a></li>
       <li><a href="#logs" data-view="logs">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
         运行日志</a></li>
+      <li><a href="#config" data-view="config">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
+        设置</a></li>
     </ul>
-    <div class="sig">
-      <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
-      <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+    <div class="side-foot">
+      <div class="theme-set" role="group" aria-label="主题">
+        <span class="lb">主题</span>
+        <button type="button" data-theme-choice="auto">跟随系统</button>
+        <button type="button" data-theme-choice="light">浅色</button>
+        <button type="button" data-theme-choice="dark">深色</button>
+      </div>
+      <div class="sig">
+        <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
+        <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+      </div>
     </div>
   </nav>
+  <!-- 抽屉遮罩：点空白处收起左侧菜单 -->
+  <div class="nav-scrim" id="navScrim"></div>
 
   <div class="main">
     <div class="topbar">
@@ -665,12 +849,39 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
       <div class="grow"></div>
-        <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
-        <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
-      </button>
-      <button id="btnRefresh">刷新</button>
+        <button id="btnRefresh">刷新</button>
       <button class="primary" id="btnAdd">添加账号</button>
     </div>
+
+    <!-- 积分到期：按到期时间展示账号风险。窗口内到期的额度不用完就会作废，
+         调度按同一口径优先烧掉这些号（见 pool.expiryRank）。 -->
+    <section class="view" id="view-expiry" hidden>
+      <div class="box">
+        <header>
+          <h3>积分到期<span class="hint" id="expWindowHint">窗口内到期的额度不用完就会作废，调度会优先消耗它们</span></h3>
+          <div class="grow"></div>
+          <span class="note" id="expNote"></span>
+          <button id="btnExpRefresh" class="primary">重新采集</button>
+        </header>
+        <div class="pad"><div class="stats" id="expStats"></div></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>最近快到期的积分包<span class="hint" id="expPkgHint">按到期时间升序，只列还有剩余的包</span></h3>
+        </header>
+        <div class="pad" id="expPkgs"><div class="exp-empty">读取中…</div></div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>账号到期排行<span class="hint">紧迫度 → 最早到期 → 快过期额度</span></h3>
+          <div class="grow"></div>
+          <span class="note" id="expAccHint"></span>
+        </header>
+        <div class="pad" id="expAccs"><div class="exp-empty">读取中…</div></div>
+      </div>
+    </section>
 
     <!-- 账号池 -->
     <section class="view" id="view-accounts">
@@ -701,7 +912,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="stat"><div class="v" id="sTodayUsed">-</div><div class="k">今日已耗</div></div>
         </div>
         <div class="tbl-wrap">
-        <table class="acc">
+        <table class="acc" id="accTable">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th class="drag-col" title="按住 ⠿ 上下拖动可调整选号顺序（顺序模式下生效）"></th>
@@ -784,6 +995,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
+    <!-- 定时任务：列表 / 新建 / 编辑 / 启停 / 立即运行 / 删除 -->
+    <section class="view" id="view-schedules" hidden>
+      <div class="box">
+        <header>
+          <h3>定时任务 <span class="hint">15 秒扫描一次，到点自动执行并回填结果</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="scNote"></span>
+          <button class="xs" id="btnScheduleRefresh">刷新</button>
+          <button class="xs primary" id="btnScheduleAdd">新建任务</button>
+        </header>
+        <div class="pad" id="scheduleList"><div class="state">读取中…</div></div>
+      </div>
+    </section>
+
+    <!-- 成长计划：快照秒回，刷新/领奖由独立脚本按需加载 -->
+    <section class="view" id="view-growth" hidden>
+      <div id="gcRoot" class="gc-page" data-gc-root="1"></div>
+    </section>
+
     <!-- 模型与档位 -->
     <section class="view" id="view-models" hidden>
       <div class="box">
@@ -809,7 +1039,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th title="上游能力字段 supports_images（官方能力表口径：客户端可上传图片，由服务端处理；不等于模型原生多模态）">可传图</th><th>上下文长度</th><th>最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
         </div>
@@ -1304,11 +1534,34 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <header>
       <h3>添加账号</h3>
       <div class="tabs" id="addTabs">
-        <button class="tab on" data-tab="login">浏览器登录</button>
+        <button class="tab on" data-tab="phone">手机号登录</button>
+        <button class="tab" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
       </div>
     </header>
     <div class="body">
+      <!-- 手机号登录：在弹窗内直接输号码收验证码，不跳官方授权页 -->
+      <div id="addTabPhone" class="tab-panel" hidden>
+        <div class="phone-row">
+          <select id="phoneCountry" class="phone-country" aria-label="手机区号">
+            <option value="86">+86 中国大陆</option>
+            <option value="852">+852 中国香港</option>
+            <option value="853">+853 中国澳门</option>
+          </select>
+          <input id="phoneMobile" type="tel" inputmode="numeric" autocomplete="tel"
+                 maxlength="11" placeholder="请输入 11 位手机号" />
+        </div>
+        <div class="phone-row">
+          <input id="phoneCode" type="tel" inputmode="numeric" autocomplete="one-time-code"
+                 maxlength="6" placeholder="6 位短信验证码" />
+          <button id="btnPhoneSend" class="primary phone-send">获取验证码</button>
+        </div>
+        <button id="btnPhoneVerify" class="primary" style="width:100%;margin:2px 0 10px">登录并添加账号</button>
+        <div class="hint" style="font-size:12px">验证码由运营商下发到你的手机，仅用于本次登录验证。全程在本页完成，不会跳转官方页面；登录成功后凭证直接进入账号池，激活与余额在后台更新。</div>
+        <div class="state" id="phoneMsg" hidden></div>
+        <div class="state ok" id="phoneDone" hidden></div>
+        <div class="state err" id="phoneErr" hidden></div>
+      </div>
       <!-- 浏览器登录 -->
       <div id="addTabLogin" class="tab-panel">
         <div id="addPick">
@@ -1346,6 +1599,46 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
+<!-- 定时任务编辑 -->
+<div class="veil" id="scheduleModal" data-lock="1">
+  <div class="dlg" style="width:min(560px,calc(100vw - 24px))">
+    <header><h3 id="scModalTitle">新建定时任务</h3>
+      <div class="hint">固定间隔按分钟计；每天 / 每周 / 每月按北京时间 UTC+8 执行。</div></header>
+    <div class="body">
+      <div class="grid2">
+        <label class="fld"><span class="lb">任务名称</span><input id="scName" placeholder="留空自动按周期命名"></label>
+        <label class="fld"><span class="lb">任务类型</span><select id="scTask"></select></label>
+      </div>
+      <div class="grid2" style="margin-top:10px">
+        <label class="fld"><span class="lb">执行周期</span><select id="scCycle">
+          <option value="preset">系统预设</option><option value="interval">固定间隔</option>
+          <option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option>
+        </select></label>
+        <label class="fld" id="scIntervalWrap"><span class="lb">间隔（分钟）</span><input id="scIv" type="number" min="1" max="5256000" value="60"></label>
+      </div>
+      <div class="grid2" style="margin-top:10px" id="scCalendarWrap" hidden>
+        <label class="fld"><span class="lb">执行时间（北京时间）</span><input id="scTime" type="time" value="09:00"></label>
+        <label class="fld" id="scMonthWrap" hidden><span class="lb">每月几号</span><input id="scMonthday" type="number" min="1" max="31" value="1"></label>
+      </div>
+      <div id="scWeekWrap" class="fld" style="margin-top:10px" hidden><span class="lb">执行日（周一=0）</span>
+        <div class="inline" style="gap:10px;flex-wrap:wrap">
+          <label><input type="checkbox" name="scWeekday" value="0"> 一</label>
+          <label><input type="checkbox" name="scWeekday" value="1"> 二</label>
+          <label><input type="checkbox" name="scWeekday" value="2"> 三</label>
+          <label><input type="checkbox" name="scWeekday" value="3"> 四</label>
+          <label><input type="checkbox" name="scWeekday" value="4"> 五</label>
+          <label><input type="checkbox" name="scWeekday" value="5"> 六</label>
+          <label><input type="checkbox" name="scWeekday" value="6"> 日</label>
+        </div>
+      </div>
+      <label class="fld" style="margin-top:10px"><span class="lb">停止时间（可选，本地时间）</span><input id="scStop" type="datetime-local"></label>
+      <div class="switch" style="margin-top:12px"><span class="lb">启用任务</span><input type="checkbox" id="scEnabled" checked></div>
+      <div class="state err" id="scErr" hidden></div>
+    </div>
+    <footer><span class="grow"></span><button id="scCancel">取消</button><button class="primary" id="scSave">保存任务</button></footer>
+  </div>
+</div>
+
 <!-- 密钥 -->
 <div class="veil" id="keyVeil" data-lock="1">
   <div class="dlg" style="width:420px">
@@ -1366,6 +1659,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <div id="toasts"></div>
 
+<script src="growth_center.js"></script>
+<script src="schedules.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

@@ -1474,6 +1474,17 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	return false
 }
 
+// routeAliasID 报告 id 是否是**路由别名**：它们指向另一个真实模型（官方客户端的
+// "按档位自动选"入口 / 默认路由），在上游 models 表里有定义但没有独立能力快照，
+// agents 名单通常也不列。诊断行据此把"别名"与"真的没权限"分开解释。
+func routeAliasID(id string) bool {
+	switch strings.ToLower(strings.TrimSpace(id)) {
+	case "auto", "default", "default-model", "fast-model", "balanced-model", "deep-model":
+		return true
+	}
+	return false
+}
+
 // codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
 // 官方 IDE 头 `CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0`。
 // 版本号需随上游 IDE 发版跟进：UA 版本过旧时该端点可能同样返回精简目录。
@@ -1531,6 +1542,11 @@ type ModelFetchDiag struct {
 	// 与 Dropped 配对读——Dropped 是"上游给了但被筛掉"，V3OnlyIDs 是"只有 v3 给了、
 	// 靠追加才进得来"，两者合起来能回答"这个模型为什么不在列表里"的全部成因。
 	V3OnlyIDs []string `json:"v3_only_ids"`
+	// DroppedAlias 是 Dropped 里属于**路由别名**的那部分（auto/default/fast-model/
+	// balanced-model/deep-model）。它们指向某个真实模型、不是独立模型，上游 models 表
+	// 里出现但 agents 名单不列 —— 面板诊断行把"别名"与"未授权"分开说，用户才不会
+	// 以为网关漏了一堆模型。
+	DroppedAlias []string `json:"dropped_alias"`
 }
 
 // ModelFetchAgent 上游 agents 数组的一项（只取诊断需要的字段）。
@@ -1554,7 +1570,13 @@ func (c *Client) FetchModelsDiag(a *auth.Auth) ([]ModelInfo, ModelFetchDiag, err
 	return c.FetchModelsDiagContext(context.Background(), a)
 }
 
-const modelRequestTimeout = 4 * time.Second
+// modelRequestTimeout 单个目录端点的读超时。
+//
+// 从 4s 放宽到 8s：冷启动（App 刚起来、TLS 未预热）时实测 TTFB 2~5s，4s 会把
+// 第一次 /v1/models 直接打成失败，进 5 分钟负缓存 → 客户端拿到静态兜底列表
+// （没有倍率、没有真实窗口）。目录拉取是低频操作（10min TTL），放宽超时的代价
+// 远小于「首次拉取必失败」。
+const modelRequestTimeout = 8 * time.Second
 
 // FetchModelsDiagContext bounds the complete catalog lookup, including endpoint
 // fallbacks and optional capability probes. Cancellation reaches HTTP reads.
@@ -1744,38 +1766,61 @@ func (c *Client) fetchModelsOnce(ctx context.Context, a *auth.Auth, path string)
 	for _, m := range env.Data.Models {
 		diag.RawModelIDs = append(diag.RawModelIDs, m.ID)
 	}
-	// agents 名单决定「能调哪些」（CN /console 形态）。国际站 /v2 形态可能不带 agents：
-	// 此时以过滤后的全表为可用集，而不是整条路径判失败（否则 global 目录永远拿不到
-	// 倍率/档位/上下文，面板那几列全空）。
-	if len(cliIDs) == 0 {
-		cliIDs = allIDs
-	}
-	if len(cliIDs) == 0 {
-		return nil, diag, fmt.Errorf("models api returned empty list")
-	}
+	// ── 目录口径（对齐参考项目 converter.fetch_models：用上游 models 全表）────
+	//
+	// 改动前用 agents[name=cli].models 做硬过滤，只留 17 个；实测被过滤掉的
+	// kimi-k2.5 / deepseek-v3-2-volc 等其实能正常调用（200），只是"官方 CLI 当前没
+	// 把它放进快捷名单"。上游的 models 数组才是完整目录（参考项目取的就是它，36 个）。
+	//
+	// 因此这里改成：
+	//   * 基底 = models 全表（nonChatModel 已在上面滤掉视频/补全/嵌入类）；
+	//   * agents 名单只用于排序（名单内的排前，标记官方 CLI 推荐），不再丢弃条目；
+	//   * 仍排除：上游标 disabled 的、以及路由别名（fast-model / default / auto 等，
+	//     它们指向别的模型，不是独立能力条目，列出来就是重复）。
+	//
+	// HTTP 请求（端点 / UA / 头 / 重试）一行未改：参考项目直接照搬会被引到
+	// "不是官方客户端"的风控分支，而当前这条链路的请求形态是已验证可用的。
+	// 这里只动「拿到响应后怎么解析」，因此不会把网关改成不可用。
 	diag.AllModelIDs = allIDs
-	seen := make(map[string]bool, len(cliIDs))
-	out := make([]ModelInfo, 0, len(cliIDs))
+	inAgents := make(map[string]bool, len(cliIDs))
 	for _, id := range cliIDs {
+		inAgents[id] = true
+	}
+	seen := make(map[string]bool, len(allIDs))
+	out := make([]ModelInfo, 0, len(allIDs))
+	for _, id := range allIDs {
 		if seen[id] {
 			continue
 		}
 		seen[id] = true
-		if pm, ok := dynMap[id]; ok && !pm.disabled {
-			out = append(out, pm.mi)
+		pm, ok := dynMap[id]
+		// 只排除上游明确 disabled 的条目；路由别名（auto / default-model /
+		// fast-model …）在上游 models 表里是合法条目，参考项目同样列出，不能因为
+		// "它指向别的模型"就替上游把它删掉（会连 default-model / auto 一起丢）。
+		if !ok || pm.disabled {
+			continue
 		}
+		out = append(out, pm.mi)
 	}
 	if len(out) == 0 {
 		return nil, diag, fmt.Errorf("models api returned empty list")
 	}
-	// 记账：agent 名单里列了、但最终没进结果的（disabled / 不在 models 表里）。
+	// 名单内的排前面（稳定排序，不打乱上游其余顺序），方便面板把官方 CLI 推荐置顶。
+	sort.SliceStable(out, func(i, j int) bool {
+		return inAgents[out[i].ID] && !inAgents[out[j].ID]
+	})
+	// 记账：全表里因 disabled / 路由别名 没进结果的（不再是 agents 没列）。
 	inOut := make(map[string]bool, len(out))
 	for _, mi := range out {
 		inOut[mi.ID] = true
 	}
 	for _, id := range diag.AllModelIDs {
-		if !inOut[id] {
-			diag.Dropped = append(diag.Dropped, id)
+		if inOut[id] {
+			continue
+		}
+		diag.Dropped = append(diag.Dropped, id)
+		if routeAliasID(id) {
+			diag.DroppedAlias = append(diag.DroppedAlias, id)
 		}
 	}
 	// v3/config 覆盖（能力补全 + 限时优惠 promo_*）。**按 realm 分路**：

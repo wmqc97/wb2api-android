@@ -226,6 +226,14 @@ func v3CatalogInfos(cap map[string]ModelInfo) []ModelInfo {
 // 同一条纪律两处写法，漏一处就是"企业端点挂掉时全部模型倍率未知"。
 // 返回 nil（而非空 map）表示"本轮没有任何倍率"——与 storeGlobalModels 的语义一致。
 func detachCredits(merged []ModelInfo) map[string]string {
+	// 先在本轮数据还带倍率时并入旁表，再摘进返回值。
+	//
+	// 顺序很关键：本函数的返回值（credits 旁表）只服务 /v1/stats 的倍率透出，
+	// 而 /v1/models 的 name、以及「这一轮上游没给倍率时用历史值回填」都依赖
+	// modelCreditsTable。若先 detach 再记，记进去的是**已清空的 Credits**，
+	// 结果就是 global 条目在 /v1/models 里永远只有裸名（用户实测症状：
+	// 「只有新模型有倍率，老模型没显示」）。
+	RecordModelCredits("global", merged)
 	var credits map[string]string
 	for i := range merged {
 		cr := merged[i].Credits

@@ -1010,7 +1010,8 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 	found := false
 	for _, m := range data {
-		if m.(map[string]any)["id"] == "cn:glm-5.2" {
+		// id 可能带「|×倍率」展示后缀（models.id_multiplier_suffix），断言前剥掉。
+		if stripPriceSuffix(m.(map[string]any)["id"].(string)) == "cn:glm-5.2" {
 			found = true
 		}
 	}
@@ -1046,7 +1047,8 @@ func TestModelsDynamic(t *testing.T) {
 	}
 	ids := map[string]bool{}
 	for _, m := range data {
-		ids[m.(map[string]any)["id"].(string)] = true
+		// 同样先剥「|×倍率」后缀，再按「前缀 + 裸名」断言。
+		ids[stripPriceSuffix(m.(map[string]any)["id"].(string))] = true
 	}
 	if !ids["cn:dyn-model-a"] || !ids["cn:glm-9.9"] {
 		t.Errorf("dynamic ids missing: %v", ids)
@@ -1055,7 +1057,7 @@ func TestModelsDynamic(t *testing.T) {
 	// 断言字段映射：maxInputTokens → context_length，maxOutputTokens → max_output_tokens
 	for _, m := range data {
 		mm := m.(map[string]any)
-		switch mm["id"] {
+		switch stripPriceSuffix(mm["id"].(string)) {
 		case "dyn-model-a":
 			if mm["context_length"].(float64) != 65536 {
 				t.Errorf("dyn-model-a context_length=%v want 65536", mm["context_length"])

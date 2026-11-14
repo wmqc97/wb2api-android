@@ -5,6 +5,7 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let loginPollState = null;
+let badgeTimer = null; // 侧栏「积分到期」角标轮询
 let refTimer = null;
 // 账号表拖拽排序的瞬时状态（null = 未在拖拽）：{uid, row}。见「账号拖拽排序」段。
 let dragState = null;
@@ -35,20 +36,24 @@ function effTheme() {
   const p = themePref();
   return p === 'auto' ? (systemDark() ? 'dark' : 'light') : p;
 }
+/* 主题选择移到左侧栏底部（与参考项目一致）：三态按钮常驻，选中态高亮。
+   仍然生效的既有语义：选择记在 localStorage，auto 才跟随系统。 */
 function applyTheme() {
   const eff = effTheme();
   document.documentElement.dataset.theme = eff;
-  $('icoTheme').innerHTML = eff === 'light'
-    ? '<circle cx="8" cy="8" r="3"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
-    : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
-  $('btnTheme').title = '主题：' + THEME_LABEL[themePref()]
-    + '（当前：' + (eff === 'light' ? '浅色' : '深色') + '，点击切换）';
+  const pref = themePref();
+  document.querySelectorAll('.theme-set button').forEach(b => {
+    const on = b.dataset.themeChoice === pref;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', String(on));
+    b.title = THEME_LABEL[b.dataset.themeChoice] + (on ? '（当前）' : '');
+  });
 }
-/* 点击循环：跟随系统 → 浅色 → 深色 → 跟随系统。 */
-function cycleTheme() {
-  localStorage.setItem(LS_THEME, { auto: 'light', light: 'dark', dark: 'auto' }[themePref()]);
+function setTheme(pref) {
+  localStorage.setItem(LS_THEME, pref === 'light' || pref === 'dark' ? pref : 'auto');
   applyTheme();
 }
+document.querySelectorAll('.theme-set button').forEach(b => { b.onclick = () => setTheme(b.dataset.themeChoice); });
 function onSystemThemeChange() {
   // 只有「跟随系统」时才随系统切换；手动选定的浅色/深色保持不变。
   if (themePref() === 'auto') applyTheme();
@@ -58,7 +63,6 @@ if (typeof themeMedia.addEventListener === 'function') {
 } else if (typeof themeMedia.addListener === 'function') {
   themeMedia.addListener(onSystemThemeChange);
 }
-$('btnTheme').onclick = cycleTheme;
 applyTheme();
 
 /* ── 请求 ─────────────────────────────────────────────────────────── */
@@ -176,21 +180,32 @@ const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟�
 // 由 renderExpiry 顺带算出（与到期提醒逐行同口径）。null = 套餐信息还没拉到。
 let expDailyNeed = null;
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', expiry: '积分到期', usage: '用量', packages: '积分构成', taskscenter: '任务中心', growth: '成长计划', schedules: '定时任务', models: '模型与档位', logs: '运行日志', config: '设置' };
 function go(v) {
+  if (view === 'growth' && v !== 'growth') window.WBGrowthCenter?.leave?.();
+  if (view === 'schedules' && v !== 'schedules') window.WBSchedules?.leave?.();
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'expiry') loadCreditsPage();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'accounts' && lastPackages) renderExpiry(lastPackages);
   if (v === 'taskscenter') { loadSchoolStatus(true); reattachQueueView(); }
+  if (v === 'growth') window.WBGrowthCenter?.enter();
+  if (v === 'schedules') window.WBSchedules?.enter();
 }
-document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
+document.querySelectorAll('.nav a').forEach(a => a.onclick = e => {
+  e.preventDefault();
+  go(a.dataset.view);
+  history.replaceState(null, '', '#' + a.dataset.view);
+  navClose(); // 移动端抽屉：选中即收起（桌面端 navClose 是空操作）
+});
+
 /* 首屏 go() 延到整份脚本求值之后再执行（v1.9.30 的 TDZ 回归修复，上游 981bbe2 同法）。
    根因：go() 同步触发视图数据加载，而 loadModels 读的 mdRealm 等模块级 let/const 在
    文件下半段才初始化——以 #models 深链直接打开（刷新停在模型页 / 书签 / 外链）时，
@@ -201,6 +216,27 @@ setTimeout(() => {
   const hash = (location.hash || '#accounts').slice(1);
   go(hash in TITLES ? hash : 'accounts');
 }, 0);
+
+/* 左侧导航抽屉（移动端 hamburger，参考项目同款交互）。 */
+function navOpen() {
+  const nav = $('nav'), scrim = $('navScrim'), btn = $('navToggle');
+  if (!nav) return;
+  nav.classList.add('open');
+  if (scrim) scrim.classList.add('on');
+  if (btn) btn.setAttribute('aria-expanded', 'true');
+  // 抽屉展开时锁背景滚动：否则手指滑动会带着后面的长列表一起跑。
+  document.body.classList.add('nav-open');
+}
+function navClose() {
+  const nav = $('nav'), scrim = $('navScrim'), btn = $('navToggle');
+  if (nav) nav.classList.remove('open');
+  if (scrim) scrim.classList.remove('on');
+  if (btn) btn.setAttribute('aria-expanded', 'false');
+  document.body.classList.remove('nav-open');
+}
+if ($('navToggle')) $('navToggle').onclick = () => ($('nav').classList.contains('open') ? navClose() : navOpen());
+if ($('navScrim')) $('navScrim').onclick = navClose;
+document.addEventListener('keydown', e => { if (e.key === 'Escape') navClose(); });
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 /* 模型级冷却台账（overview 的 rate_limited_models，issue #36）：6004 模型级限流 /
@@ -1019,7 +1055,7 @@ function renderModelRealms(d) {
 async function loadModels(cached = false) {
   const seq = ++mdLoadSeq;
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="8"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
     const q = mdRealm ? '?realm=' + mdRealm : '';
@@ -1029,7 +1065,7 @@ async function loadModels(cached = false) {
     mdRealm = d.realm || mdRealm || 'global'; // 后端回显为准（缺省域由池内可用域决定）
     renderModelRealms(d);
     const list = mdSortList((d.models || []).filter(m => mdMatch(m)));
-    if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
+    if (!list.length) { tb.innerHTML = '<tr><td colspan="8"><div class="empty">上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
     const probeKeys = Object.keys(probes);
     const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
@@ -1050,6 +1086,8 @@ async function loadModels(cached = false) {
         '<td class="num">' + rateCell(m) + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
+        // 图片能力：上游能力字段 supports_images（无该字段 = 不支持/未知，显示 —）
+        '<td class="num">' + (m.supports_images ? '<span class="tag ok">支持</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
         outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
@@ -1062,11 +1100,25 @@ async function loadModels(cached = false) {
     if ((dg.hidden || []).length) parts.push('隐藏别名 ' + dg.hidden.length + ' 个');
     if (!(dg.cli_agent_ids || []).length) parts.push('上游未给 agents 名单（按全表展示）');
     const dropped = dg.dropped || [];
-    if (dropped.length) parts.push('未进列表 ' + dropped.length + ' 个（' + dropped.join(', ') + '）');
+    const alias = dg.dropped_alias || [];
+    if (dropped.length) {
+      // 未进列表 = 上游 models 全表里被排除的：路由别名（指向别的真实模型）
+      // 或上游标记 disabled。agents 名单现在只用于排序，不再用它硬过滤，
+      // 因此这里不再写「agents 名单未列，调了会 11102」（那已经不是事实）。
+      const rest = dropped.filter(id => alias.indexOf(id) < 0);
+      let line = '未进列表 ' + dropped.length + ' 个（路由别名 / 上游标记禁用）';
+      if (alias.length) line += '，其中路由别名 ' + alias.length + ' 个：' + alias.join(', ');
+      if (rest.length) line += (alias.length ? '；其余 ' : '：') + rest.length + ' 个：' + rest.join(', ');
+      parts.push(line);
+    }
     // v3 独有：企业端点没有、靠 /v3/config 追加进来的 id。与"未进列表"配对看——
     // 前者是"上游给了但被筛掉"，这里是"只有 v3 给了、靠追加才进得来"。
     const v3only = dg.v3_only_ids || [];
     if (v3only.length) parts.push('v3 补充 ' + v3only.length + ' 个（' + v3only.join(', ') + '）');
+    // 「可传图」口径说明：标识来自上游能力字段 supportsImages（官方能力表），
+    // 不是实测多模态能力；把数量写进诊断行，避免用户以为是我们逐个测过的。
+    const imgN = list.filter(m => m.supports_images).length;
+    parts.push('可传图 ' + imgN + '/' + list.length + ' 个（上游声明）');
     parts.push('已刷新降级缓存');
     if (hit) parts.push(hit + ' 个有实测上限');
     $('mdNote').textContent = parts.join(' · ');
@@ -1081,7 +1133,7 @@ async function loadModels(cached = false) {
     });
   } catch (e) {
     if (seq !== mdLoadSeq) return;
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
 $('btnModels').onclick = () => loadModels();
@@ -1332,21 +1384,32 @@ $('cfgForm').onsubmit = async ev => {
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');
-  // 重置到登录标签（导入标签的残留回执一并清掉）
-  switchAddTab('login');
+  // 默认落在「手机号登录」：面板内直接收码，不跳官方授权页
+  // （官方页最后一步是 workbuddy:// 私有协议回调，手机浏览器走不到底）。
+  phoneReset();
   $('addPick').hidden = false;
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('importDone').hidden = true; $('importErr').hidden = true;
-  $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
-  $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
+  $('btnStartLogin').disabled = false;
   stopPoll();
+  // 切标签放最后：switchAddTab 会按当前标签决定底部按钮显隐
+  // （手机号页不显示「获取授权链接/复制/打开」）。
+  switchAddTab('phone');
 }
 // switchAddTab 登录 / 导入 JSON 两个标签页互斥显示（吸收上游 9371f7d）。
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $('addTabPhone').hidden = tab !== 'phone';
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
+  // 底部按钮属于「浏览器登录」标签页：手机号/导入页不该出现授权链接相关按钮
+  // （切回登录页且没有在途会话时恢复「获取授权链接」）。
+  if (tab !== 'login') {
+    $('btnStartLogin').hidden = true; $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
+  } else if (!loginState) {
+    $('btnStartLogin').hidden = false; $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
+  }
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -1426,15 +1489,151 @@ $('importFile').onchange = async () => {
   } finally { $('importFile').disabled = false; $('importFile').value = ''; }
 };
 
+/* ── 手机号登录（面板内收验证码，不跳官方页）───────────────────────── */
+/* 移植自参考实现 admin/wb_login.py + join.html：整条授权链在服务端用纯 HTTP 跑完，
+   前端只负责「输号码 → 收码 → 输码」三步，因此手机浏览器也能完成。
+   phoneSid 是服务端会话号；刷新页面后前端会丢掉它，重新发码即可（服务端会话有 TTL）。 */
+let phoneSid = '';
+let phoneTimer = null;
+let phoneRetryUntil = 0;
+const PHONE_PATTERNS = { '86': /^1[3-9]\d{9}$/, '852': /^[4-9]\d{7}$/, '853': /^6\d{7}$/ };
+
+// phoneApi 与 api() 的差别：错误响应**不抛异常**，因为发码失败要读 step/reason/retry_after
+// （need_captcha 要提示换号，节流要给倒计时）。401 仍按密钥失效处理。
+async function phoneApi(path, body) {
+  const h = { 'Content-Type': 'application/json' };
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  const r = await fetch('/panel/api/' + path, { method: 'POST', headers: h, body: JSON.stringify(body || {}) });
+  if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+  let d = {};
+  try { d = await r.json(); } catch (e) { d = {}; }
+  return { ok: r.ok, status: r.status, data: d };
+}
+
+function phoneMsg(el, text) {
+  const box = $(el);
+  if (!box) return;
+  box.hidden = !text;
+  box.textContent = text || '';
+}
+
+function phoneReset() {
+  phoneSid = ''; phoneRetryUntil = 0;
+  if (phoneTimer) { clearInterval(phoneTimer); phoneTimer = null; }
+  ['phoneMobile', 'phoneCode'].forEach(id => { if ($(id)) $(id).value = ''; });
+  ['phoneMsg', 'phoneDone', 'phoneErr'].forEach(id => phoneMsg(id, ''));
+  $('btnPhoneSend').disabled = false; $('btnPhoneSend').textContent = '获取验证码';
+  $('btnPhoneVerify').disabled = false; $('btnPhoneVerify').textContent = '登录并添加账号';
+}
+
+function phoneCountdown(sec) {
+  phoneRetryUntil = Date.now() + Math.max(0, sec) * 1000;
+  const btn = $('btnPhoneSend');
+  if (phoneTimer) { clearInterval(phoneTimer); phoneTimer = null; }
+  const tick = () => {
+    const left = Math.ceil((phoneRetryUntil - Date.now()) / 1000);
+    if (left <= 0) {
+      if (phoneTimer) { clearInterval(phoneTimer); phoneTimer = null; }
+      btn.disabled = false; btn.textContent = '获取验证码';
+      return;
+    }
+    btn.disabled = true; btn.textContent = left + 's';
+  };
+  tick();
+  if (phoneRetryUntil > Date.now()) phoneTimer = setInterval(tick, 1000);
+}
+
+async function phoneSendCode() {
+  if (Date.now() < phoneRetryUntil) return;
+  const country = $('phoneCountry').value;
+  const mobile = ($('phoneMobile').value || '').replace(/\D/g, '');
+  phoneMsg('phoneErr', ''); phoneMsg('phoneDone', '');
+  if (!PHONE_PATTERNS[country] || !PHONE_PATTERNS[country].test(mobile)) {
+    phoneMsg('phoneErr', '请输入所选地区的有效手机号');
+    $('phoneMobile').focus();
+    return;
+  }
+  const btn = $('btnPhoneSend');
+  btn.disabled = true; btn.textContent = '发送中…';
+  try {
+    const r = await phoneApi('login/phone/send', { sid: phoneSid, mobile: mobile, country_code: country });
+    if (!r.ok) {
+      const d = r.data || {};
+      // need_captcha：上游按**号**风控（同号短时间发码太多次），换号或稍后再试可解。
+      phoneMsg('phoneErr', d.reason === 'need_captcha'
+        ? '该手机号需要完成安全验证，请稍后再试或改用其他手机号'
+        : (d.error || '发送验证码失败'));
+      if (d.step === 'session') phoneSid = '';
+      if (d.retry_after) phoneCountdown(d.retry_after);
+      return;
+    }
+    phoneSid = r.data.sid || phoneSid;
+    phoneMsg('phoneMsg', '验证码已发送至 +' + country + ' ' + mobile + '，10 分钟内有效');
+    phoneCountdown(r.data.retry_after || 60);
+    $('phoneCode').focus();
+  } catch (e) {
+    phoneMsg('phoneErr', e.message || '网络异常，请稍后重试');
+  } finally {
+    if (Date.now() >= phoneRetryUntil) { btn.disabled = false; btn.textContent = '获取验证码'; }
+  }
+}
+
+async function phoneVerify() {
+  const code = ($('phoneCode').value || '').replace(/\D/g, '');
+  phoneMsg('phoneErr', ''); phoneMsg('phoneDone', '');
+  if (code.length !== 6) { phoneMsg('phoneErr', '请输入 6 位数字验证码'); $('phoneCode').focus(); return; }
+  if (!phoneSid) { phoneMsg('phoneErr', '请先获取验证码'); return; }
+  const btn = $('btnPhoneVerify');
+  btn.disabled = true; btn.textContent = '登录中…';
+  try {
+    const r = await phoneApi('login/phone/verify', { sid: phoneSid, code: code });
+    if (!r.ok) {
+      const d = r.data || {};
+      phoneMsg('phoneErr', d.error || '登录失败，请重试');
+      if (d.step === 'session' || d.step === 'sms_verify') phoneSid = d.step === 'session' ? '' : phoneSid;
+      return;
+    }
+    const d = r.data || {};
+    phoneSid = '';
+    if (phoneTimer) { clearInterval(phoneTimer); phoneTimer = null; }
+    $('btnPhoneSend').disabled = true; $('btnPhoneSend').textContent = '已完成';
+    phoneMsg('phoneMsg', '');
+    phoneMsg('phoneDone', '已添加 ' + (d.nickname || d.uid) + '，账号已载入池中（激活与余额在后台更新）');
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } catch (e) {
+    phoneMsg('phoneErr', e.message || '网络异常，请稍后重试');
+  } finally {
+    btn.disabled = false; btn.textContent = '登录并添加账号';
+  }
+}
+
+$('btnPhoneSend').onclick = phoneSendCode;
+$('btnPhoneVerify').onclick = phoneVerify;
+$('phoneCountry').onchange = () => {
+  const c = $('phoneCountry').value;
+  $('phoneMobile').maxLength = c === '86' ? 11 : 8;
+  $('phoneMobile').placeholder = $('phoneMobile').maxLength + ' 位手机号';
+  phoneMsg('phoneErr', '');
+};
+['phoneMobile', 'phoneCode'].forEach(id => {
+  $(id).oninput = () => {
+    $(id).value = $(id).value.replace(/\D/g, '');
+    phoneMsg('phoneErr', '');
+  };
+});
+$('phoneMobile').onkeydown = e => { if (e.key === 'Enter') phoneSendCode(); };
+$('phoneCode').onkeydown = e => { if (e.key === 'Enter') phoneVerify(); };
+
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
   b.disabled = true; b.textContent = '刷新中…';
   try {
-    await api('balance_all', { method: 'POST' });
-    await loadOverview(true);
-    toast('余额已从上游刷新', 'ok');
+    if (view === 'growth') { const uid = window.WBGrowthCenter?.selectedUid?.(); if (!uid) throw new Error('请先选择账号'); await window.WBGrowthCenter.refresh(); }
+    else { await api('balance_all', { method: 'POST' }); await loadOverview(true); }
+    toast(view === 'growth' ? '成长状态刷新已启动' : '余额已从上游刷新', 'ok');
   } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
   finally { b.disabled = false; b.textContent = '刷新'; }
   if (view === 'logs') loadLogs();
@@ -1445,6 +1644,8 @@ function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
+  else if (view === 'growth') window.WBGrowthCenter?.refreshSelected();
+  else if (view === 'schedules') window.WBSchedules?.load(true);
 }
 function start() {
   loadOverview(true);
@@ -1454,6 +1655,10 @@ function start() {
   loadConfig(true);
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
+  // 侧栏「积分到期」角标：只读池内已同步的快过架子集（不打上游），30s 一次足够。
+  loadCreditBadge();
+  if (badgeTimer) clearInterval(badgeTimer);
+  badgeTimer = setInterval(loadCreditBadge, 30000);
   checkAuthGate();
 }
 async function checkAuthGate() {
@@ -1461,6 +1666,132 @@ async function checkAuthGate() {
   catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
 }
 start();
+
+/* ── 积分到期视图（独立视图，端点 /panel/api/credits/expiry）──────────
+   口径与调度一致：窗口内到期且还有剩余的额度是「可抢救」的，调度会优先消耗它们
+   （pool.expiryRank 的 rank 0）。这里只做展示与排序，不改任何状态。 */
+function fmtCredit(n) { const v = Number(n || 0); return isFinite(v) ? v.toLocaleString('zh-CN') : String(n); }
+let expData = null, expAt = 0, expLoading = false;
+
+function expWhen(ms) {
+  if (ms == null) return '长期有效';
+  const d = new Date(Number(ms));
+  if (isNaN(d.getTime())) return '—';
+  const p2 = n => String(n).padStart(2, '0');
+  return (d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+}
+function expLeft(days) {
+  if (days == null) return '长期有效';
+  const n = Number(days);
+  if (!(n > 0)) return '已到期';
+  if (n < 1) return Math.max(1, Math.round(n * 24)) + ' 小时后';
+  return Math.round(n) + ' 天后';
+}
+function expTag(expired, soon, days) {
+  const cls = expired ? 'dead' : (soon ? 'soon' : 'ever');
+  const txt = expired ? '已过期' : expLeft(days) + '到期';
+  return '<span class="exp-tag ' + cls + '">' + esc(txt) + '</span>';
+}
+function expRankLabel(rank) {
+  if (rank === 0) return '<span class="exp-tag soon">快到期</span>';
+  if (rank === 1) return '<span class="exp-tag ever">有到期日</span>';
+  return '<span class="exp-tag ever">长期有效</span>';
+}
+
+function renderExpiryView(d) {
+  const sum = d.summary || {};
+  const win = d.window_days || 7;
+  const stats = $('expStats');
+  if (stats) {
+    stats.innerHTML =
+      usStat(fmtCredit(sum.expiring_soon_remaining || 0), win + ' 天内到期（可抢救）', 'warn') +
+      usStat(String(sum.expiring_accounts || 0), '快到期账号', (sum.expiring_accounts ? 'warn' : '')) +
+      usStat(expWhen(sum.soonest_expire_at), '最近作废时刻') +
+      usStat(fmtCredit(sum.expired_remaining || 0), '已过期残留额度', (sum.expired_remaining ? 'bad' : ''));
+  }
+  if ($('expWindowHint')) {
+    $('expWindowHint').textContent = win + ' 天内到期的额度不用完就会作废，调度会优先消耗它们';
+  }
+  if ($('expNote')) {
+    $('expNote').textContent = '账号 ' + (sum.accounts || 0) + ' · 在列积分包 ' + (sum.packages || 0);
+  }
+
+  const pkgs = $('expPkgs');
+  if (pkgs) {
+    const rows = d.packages || [];
+    pkgs.innerHTML = rows.length ? rows.map(function(p) {
+      return '<div class="exp-row">' +
+        '<div class="nm"><span class="t">' + esc(p.nickname || p.uid) + '</span>' +
+          '<span class="u">' + esc(String(p.uid).slice(0, 12)) + '</span></div>' +
+        '<div class="pkg" title="' + esc(p.name || '') + '">' + esc(p.name || '积分包') + '</div>' +
+        '<div class="num"><b>' + fmtCredit(p.remain) + '</b>/' + fmtCredit(p.size) + '</div>' +
+        '<div class="when">' + esc(expWhen(p.expire_at)) + '</div>' +
+        '<div class="when">' + expTag(p.expired, p.expiring_soon, p.days_left) + '</div>' +
+        '</div>';
+    }).join('') : '<div class="exp-empty">没有需要关注的积分包（都还有长期额度）</div>';
+  }
+
+  const acc = $('expAccs');
+  if (acc) {
+    const rows = d.accounts || [];
+    if ($('expAccHint')) $('expAccHint').textContent = '紧迫度 → 最早到期 → 快过期额度';
+    acc.innerHTML = rows.length ? rows.map(function(a) {
+      if (a.error) {
+        return '<div class="exp-row">' +
+          '<div class="nm"><span class="t">' + esc(a.nickname || a.uid) + '</span></div>' +
+          '<div class="pkg" style="color:var(--bad)">' + esc(a.error) + '</div>' +
+          '<div class="num">—</div><div class="when">—</div><div class="when"></div></div>';
+      }
+      return '<div class="exp-row">' +
+        '<div class="nm"><span class="t">' + esc(a.nickname || a.uid) + '</span>' +
+          '<span class="u">' + esc(String(a.uid).slice(0, 12)) + '</span></div>' +
+        '<div class="pkg">' + expRankLabel(a.rank) + '</div>' +
+        '<div class="num">快过期 <b>' + fmtCredit(a.expiring_soon || 0) + '</b></div>' +
+        '<div class="num">总 ' + fmtCredit(a.credits || 0) + '</div>' +
+        '<div class="when">' + esc(a.soonest_expire_at ? expLeft(a.days_left) + '到期' : '长期有效') + '</div>' +
+        '</div>';
+    }).join('') : '<div class="exp-empty">尚未采集到账号积分明细</div>';
+  }
+}
+
+async function loadCreditsPage(force) {
+  if (expLoading) return;
+  if (!force && expData && Date.now() - expAt < 60000) { renderExpiryView(expData); return; }
+  expLoading = true;
+  const btn = $('btnExpRefresh');
+  if (btn) { btn.disabled = true; btn.textContent = '采集中…'; }
+  if ($('expPkgs') && !expData) $('expPkgs').innerHTML = '<div class="exp-empty"><span class="dots">正在逐个账号采集积分包</span></div>';
+  try {
+    // 逐账号实时查上游（账号多时几十秒），超时给足。
+    const d = await api('credits/expiry', { timeoutMs: 180000 });
+    expData = d; expAt = Date.now();
+    renderExpiryView(d);
+    renderExpiryBadge(d.summary || {});
+  } catch (e) {
+    if ($('expPkgs')) $('expPkgs').innerHTML = '<div class="exp-empty">读取失败：' + esc(e.message) + '</div>';
+    if ($('expAccs')) $('expAccs').innerHTML = '';
+  } finally {
+    expLoading = false;
+    if (btn) { btn.disabled = false; btn.textContent = '重新采集'; }
+  }
+}
+
+/* 侧栏角标：只读池内已同步的快过架子集（不打上游），供「有多少号要烧额度」一眼可见。 */
+function renderExpiryBadge(sum) {
+  const dot = $('navExpiryDot');
+  if (!dot) return;
+  const n = Number(sum.expiring_accounts || 0);
+  dot.hidden = n <= 0;
+  dot.textContent = n > 99 ? '99+' : String(n);
+  dot.title = n > 0 ? n + ' 个账号的积分将在窗口内作废' : '';
+}
+async function loadCreditBadge() {
+  try {
+    const d = await api('credits/badge');
+    renderExpiryBadge(d || {});
+  } catch (e) { /* 角标失败静默：不影响主功能 */ }
+}
+if ($('btnExpRefresh')) $('btnExpRefresh').onclick = () => loadCreditsPage(true);
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
 let taskUID = null;

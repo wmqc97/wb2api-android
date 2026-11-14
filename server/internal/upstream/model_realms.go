@@ -6,6 +6,9 @@ func (c *Client) recordModelCatalog(realm string, infos []ModelInfo) {
 	if (realm != "cn" && realm != "global") || len(infos) == 0 {
 		return
 	}
+	// 顺带把本轮出现的倍率并入旁表：倍率按 realm 分开记（同 id 两域不同价），
+	// 供后续「这一轮上游没给倍率」时回填到 /v1/models 的名称里。
+	RecordModelCredits(realm, infos)
 	ids := make(map[string]bool, len(infos))
 	for _, mi := range infos {
 		if mi.ID != "" {

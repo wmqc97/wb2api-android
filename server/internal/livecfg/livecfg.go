@@ -20,6 +20,9 @@ type Snapshot struct {
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
 	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	// PanelAuthDisabled 面板免密开关（config panel.require_auth=false）。
+	// **只影响 /panel/***：/v1/* 的鉴权不经过本字段，两条链路互不牵连。
+	PanelAuthDisabled bool
 }
 
 // Holder 原子持有当前快照。

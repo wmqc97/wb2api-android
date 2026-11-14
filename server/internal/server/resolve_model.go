@@ -58,12 +58,38 @@ func (r RealmRouter) ResolveWithSource(model string) (realm, bare string, explic
 // ResolveRoute snapshots grouping and fallback permission in the same lookup.
 func (r RealmRouter) ResolveRoute(model string) (realm, bare string, explicit, restricted bool) {
 	if realm, bare, ok := splitRealmPrefix(model); ok {
-		return realm, bare, true, true
+		// C 段（倍率展示后缀）：cn:glm-5.2|×0.79 → 剥前缀后再剥后缀。
+		return realm, stripPriceSuffix(bare), true, true
+	}
+	// 与上面同理：客户端可能直接把 /v1/models 给的 id 原样发回来。
+	if stripped := stripPriceSuffix(model); stripped != model {
+		if realm := r.CatalogRealm(stripped); realm != "" {
+			return realm, stripped, false, true
+		}
+		return r.BareRealm(), stripped, false, false
 	}
 	if realm := r.CatalogRealm(model); realm != "" {
 		return realm, model, false, true
 	}
 	return r.BareRealm(), model, false, false
+}
+
+// priceSuffixSep 是 /v1/models 里 id 的「倍率展示后缀」分隔符。
+//
+// 为什么把倍率拼进 id 而不是只放在 name：很多 OpenAI 兼容客户端只读 id 显示模型
+// （name 字段它们根本不看），倍率在那些客户端里就完全不可见（用户实测反馈）。
+// 用 "|" 分隔而非空格/括号：上游模型 id 全是 ASCII 短横线风格，不含 "|"，剥离无歧义。
+const priceSuffixSep = "|×"
+
+// stripPriceSuffix 剥掉 id 末尾的倍率展示后缀（"glm-5.2|×0.79" → "glm-5.2"）。
+//
+// 剥完就是真正的上游模型名，路由口径与改动前逐字节一致；没带后缀的裸 id 原样返回，
+// 所以老配置（客户端里存的裸模型名）继续可用。
+func stripPriceSuffix(model string) string {
+	if i := strings.LastIndex(model, priceSuffixSep); i > 0 {
+		return model[:i]
+	}
+	return model
 }
 
 // CatalogRealm assigns models listed in just one catalog to that realm.

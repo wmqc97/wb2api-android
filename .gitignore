@@ -30,3 +30,6 @@ server/data/
 # 本地临时文件
 .tmp-*
 $null
+
+# 本地 DSH git 元数据目录，不入库
+_gitmeta/

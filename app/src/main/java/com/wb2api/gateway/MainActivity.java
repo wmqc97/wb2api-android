@@ -176,10 +176,12 @@ public class MainActivity extends Activity implements GatewayState.Listener {
         findViewById(R.id.settingsButton).setOnClickListener(v -> showMenu());
         findViewById(R.id.backButton).setOnClickListener(v -> showHome());
         powerButton.setOnClickListener(v -> togglePower());
+        // 复制的是**基址**（带 /v1）：客户端配置里要填的就是它，带不带 /v1 直接决定
+        // 能不能用；控制台面板地址不带 /v1（点开浏览器时才用 consoleUrl）。
         findViewById(R.id.copyLocalButton).setOnClickListener(
-                v -> copy(getString(R.string.home_copy_url), localUrl()));
+                v -> copy(getString(R.string.home_copy_url), localBaseUrl()));
         findViewById(R.id.copyWifiButton).setOnClickListener(
-                v -> copy(getString(R.string.home_copy_url), consoleUrl()));
+                v -> copy(getString(R.string.home_copy_url), wifiBaseUrl()));
         findViewById(R.id.copyApiKeyButton).setOnClickListener(v -> copyApiKey());
         findViewById(R.id.editApiKeyButton).setOnClickListener(v -> editApiKey());
         findViewById(R.id.resetPortButton).setOnClickListener(
@@ -188,6 +190,7 @@ public class MainActivity extends Activity implements GatewayState.Listener {
         findViewById(R.id.btnCheckinAll).setOnClickListener(v -> confirmCheckinAll());
         findViewById(R.id.btnRunAllTasks).setOnClickListener(v -> confirmRunAllTasks());
         findViewById(R.id.btnShowLogs).setOnClickListener(v -> showLogs());
+        findViewById(R.id.phoneLoginButton).setOnClickListener(v -> showPhoneLoginDialog());
         findViewById(R.id.btnShowCredits).setOnClickListener(v -> showCreditsDialog());
 
         refreshHomeInfo();
@@ -291,6 +294,31 @@ public class MainActivity extends Activity implements GatewayState.Listener {
     }
 
     /**
+     * OpenAI 兼容基址 = 控制台地址 + /v1。
+     *
+     * 首页卡片标题本来就写「Base URL」，实际显示的却是不带 /v1 的面板地址 ——
+     * 用户照着复制去填客户端，请求会打到面板路由上（404）。这里统一补上 /v1；
+     * 末位已带斜杠时只补 v1，避免出现 //v1。
+     */
+    private String baseUrlOf(String console) {
+        if (console == null || console.isEmpty()) {
+            return console;
+        }
+        return console.endsWith("/") ? console + "v1" : console + "/v1";
+    }
+
+    /** 本机基址（127.0.0.1:PORT/v1）。 */
+    private String localBaseUrl() {
+        return baseUrlOf(localUrl());
+    }
+
+    /** 局域网基址（IP:PORT/v1）；未开局域网或无 IP 时回落到本机基址。 */
+    private String wifiBaseUrl() {
+        String wifi = wifiUrl();
+        return wifi != null ? baseUrlOf(wifi) : localBaseUrl();
+    }
+
+    /**
      * 对外使用的控制台地址：局域网优先。
      *
      * 浏览器打开与「复制控制台地址」都走这里，这样同一 Wi-Fi 下的电脑/平板也能直接
@@ -311,10 +339,10 @@ public class MainActivity extends Activity implements GatewayState.Listener {
         if (homeVersionText != null && homeVersionText.length() == 0) {
             homeVersionText.setText("v" + appVersionName());
         }
-        localUrlText.setText(localUrl());
+        localUrlText.setText(localBaseUrl());
 
-        String wifi = wifiUrl();
-        wifiUrlText.setText(wifi != null ? wifi : getString(R.string.home_offline));
+        String wifi = wifiBaseUrl();
+        wifiUrlText.setText(wifi);
         wifiUrlText.setTextColor(getColor(wifi != null ? R.color.ink : R.color.ink3));
 
         String key = ServerProcess.readApiKey(this);
@@ -1124,6 +1152,9 @@ public class MainActivity extends Activity implements GatewayState.Listener {
 
     private void showLogs() {
         List<String> lines = LogRing.snapshot();
+        // 倒序：最新一行显示在最上面。日志是"边跑边看"的，正序时每次都要先把滚动条
+        // 拖到底才能看到刚发生的事；倒序后打开即是现场，往上翻是历史。
+        java.util.Collections.reverse(lines);
         final String text = lines.isEmpty() ? "（网关暂无输出）" : TextUtils.join("\n", lines);
 
         TextView tv = new TextView(this);
@@ -1170,6 +1201,28 @@ public class MainActivity extends Activity implements GatewayState.Listener {
         long remain;
         long size;
         String error;
+        // 账号状态（与网页账号池同一口径）：disabled=系统判定坏号（冻结），
+        // manualDisabled=运维临时停用，cooling=冷却中（限流/余额耗尽等）。
+        boolean disabled;
+        boolean manualDisabled;
+        boolean cooling;
+        String coolKind = "";
+        String disabledReason = "";
+        String manualReason = "";
+
+        /** 状态标签文案；无状态返回空串（不占位）。 */
+        String stateLabel(android.content.Context c) {
+            if (manualDisabled) {
+                return c.getString(R.string.account_state_suspended);
+            }
+            if (disabled) {
+                return c.getString(R.string.account_state_disabled);
+            }
+            if (cooling) {
+                return c.getString(R.string.account_state_cooling);
+            }
+            return "";
+        }
 
         long used() {
             return Math.max(0L, size - remain);
@@ -1189,6 +1242,9 @@ public class MainActivity extends Activity implements GatewayState.Listener {
         boolean free;
         boolean supportsReasoning;
         boolean canDisableThinking;
+        // supportsImages 上游能力字段 supports_images：能否吃图片输入（多模态）。
+        // 面板侧同名 JSON 字段，App 与网页用的是同一份能力数据。
+        boolean supportsImages;
         long contextLength;
         long maxOutputTokens;
     }
@@ -1331,6 +1387,12 @@ public class MainActivity extends Activity implements GatewayState.Listener {
                             row.remain = a.optLong("remain");
                             row.size = a.optLong("size");
                             row.error = a.optString("error");
+                            row.disabled = a.optBoolean("disabled", false);
+                            row.manualDisabled = a.optBoolean("manual_disabled", false);
+                            row.cooling = a.optBoolean("cooling", false);
+                            row.coolKind = a.optString("cool_kind", "");
+                            row.disabledReason = a.optString("disabled_reason", "");
+                            row.manualReason = a.optString("manual_reason", "");
                             rows.add(row);
                         }
                     }
@@ -1424,6 +1486,8 @@ public class MainActivity extends Activity implements GatewayState.Listener {
             name.setLayoutParams(nameLp);
             titleRow.addView(name);
 
+            // 状态标签：停用 / 冻结 / 冷却中。放在昵称紧后面，移动端列表一眼能看到
+            // （与网页账号池的标签同口径，理由：只看余额数字分不清"没钱"还是"被停用"）。
             // 账号后的余额进度条：与网页账号池一致，按“剩余 / 总额”计算。
             boolean hasQuota = row.size > 0;
             int remainPercent = creditRemainPercent(row);
@@ -1470,6 +1534,27 @@ public class MainActivity extends Activity implements GatewayState.Listener {
                 titleRow.addView(realm);
             }
             card.addView(titleRow);
+
+            // 状态标识独立一行：标题行本来就排满（昵称 + 余额条 + 百分比 + 域标签），
+            // 塞进同一行必然拥挤。这里用一个彩色小圆点 + 文案，不占横向空间。
+            // 配色按处置语义：停用=红、冻结=黄、冷却=灰（与网页账号池的状态色一致）。
+            String stateText = row.stateLabel(this);
+            if (!stateText.isEmpty()) {
+                TextView state = new TextView(this);
+                state.setText("● " + stateText);
+                state.setTextColor(getColor(row.manualDisabled ? R.color.bad
+                        : row.disabled ? R.color.warn : R.color.ink3));
+                state.setTextSize(11);
+                state.setSingleLine(true);
+                state.setPadding(0, dp(3), 0, 0);
+                String tip = row.manualDisabled ? row.manualReason
+                        : row.disabled ? row.disabledReason
+                        : ("冷却中" + (row.coolKind.isEmpty() ? "" : " · " + row.coolKind));
+                if (tip != null && !tip.isEmpty()) {
+                    state.setContentDescription(tip);
+                }
+                card.addView(state);
+            }
 
             // 三列等宽指标：总积分 / 已用 / 剩余。
             LinearLayout metrics = new LinearLayout(this);
@@ -1747,6 +1832,7 @@ public class MainActivity extends Activity implements GatewayState.Listener {
             row.defaultEffort = item.optString("default_effort", "");
             row.free = item.optBoolean("free", false);
             row.supportsReasoning = item.optBoolean("supports_reasoning", false);
+            row.supportsImages = item.optBoolean("supports_images", false);
             row.canDisableThinking = item.optBoolean("can_disable_thinking", false);
             row.contextLength = item.optLong("context_length", 0L);
             row.maxOutputTokens = item.optLong("max_output_tokens", 0L);
@@ -1904,6 +1990,9 @@ public class MainActivity extends Activity implements GatewayState.Listener {
                 modelRateText(row), true));
         details.addView(modelCompactLine(getString(R.string.models_efforts),
                 modelEffortsText(row), false));
+        details.addView(modelCompactLine(getString(R.string.models_images),
+                getString(row.supportsImages ? R.string.models_images_supported : R.string.models_images_none),
+                row.supportsImages));   // 支持时用强调色，一眼扫到
         details.addView(modelCompactLine(getString(R.string.models_context),
                 formatTokenLimit(row.contextLength), false));
         block.addView(details);
@@ -2043,9 +2132,206 @@ public class MainActivity extends Activity implements GatewayState.Listener {
         copy("wb2api 访问信息", sb.toString());
     }
 
+    /** 手机号登录结果回调：主线程执行（ok / 响应体 / 错误文案）。 */
+    private interface PhoneLoginCb {
+        void onResult(boolean ok, JSONObject data, String error);
+    }
+
+    /**
+     * 给面板的手机号登录端点发一条 POST（后台线程 → 主线程回调）。
+     *
+     * 这条链路在网关侧纯 HTTP 跑完（设备 state → Keycloak → OneID 短信 → 换凭证），
+     * App 只负责收集号码与验证码，拿到凭证后网关自己落盘进号池，不用跳浏览器。
+     */
+    private void phoneLoginRequest(final String path, final JSONObject body, final PhoneLoginCb cb) {
+        final String key = ServerProcess.readApiKey(this);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                HttpURLConnection connection = null;
+                String error = null;
+                JSONObject data = null;
+                try {
+                    URL url = new URL(ServerProcess.baseUrl(MainActivity.this) + path);
+                    connection = (HttpURLConnection) url.openConnection();
+                    connection.setConnectTimeout(8000);
+                    connection.setReadTimeout(120000);
+                    connection.setRequestMethod("POST");
+                    connection.setDoOutput(true);
+                    if (!key.isEmpty()) {
+                        connection.setRequestProperty("Authorization", "Bearer " + key);
+                    }
+                    connection.setRequestProperty("Content-Type", "application/json");
+                    try (OutputStream out = connection.getOutputStream()) {
+                        out.write(body.toString().getBytes(StandardCharsets.UTF_8));
+                    }
+                    int status = connection.getResponseCode();
+                    InputStream stream = status >= 200 && status < 300
+                            ? connection.getInputStream()
+                            : connection.getErrorStream();
+                    String text = readText(stream);
+                    JSONObject obj = new JSONObject(text);
+                    if (status < 200 || status >= 300) {
+                        error = obj.optString("error", status == 401 ? "API 密钥无效" : ("HTTP " + status));
+                    } else {
+                        data = obj;
+                    }
+                } catch (Exception e) {
+                    error = e.getMessage() == null || e.getMessage().isEmpty() ? "请求失败" : e.getMessage();
+                    Log.w(TAG, "手机号登录请求失败", e);
+                } finally {
+                    if (connection != null) {
+                        connection.disconnect();
+                    }
+                }
+                final String failure = error;
+                final JSONObject result = data;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (isFinishing() || isDestroyed()) {
+                            return;
+                        }
+                        cb.onResult(failure == null, result, failure);
+                    }
+                });
+            }
+        }, "wb2api-phone-login").start();
+    }
+
+    /** 手机号登录对话框：输号码 → 收码 → 输码 → 直接把账号加进号池。 */
+    private void showPhoneLoginDialog() {
+        final String[] sid = {""};
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(18);
+        root.setPadding(pad, dp(8), pad, 0);
+
+        TextView hint = new TextView(this);
+        hint.setText(R.string.phone_login_hint);
+        hint.setTextColor(getColor(R.color.ink3));
+        hint.setTextSize(12);
+        root.addView(hint);
+
+        final EditText mobile = new EditText(this);
+        mobile.setHint(R.string.phone_login_mobile);
+        mobile.setInputType(InputType.TYPE_CLASS_PHONE);
+        mobile.setSingleLine(true);
+        root.addView(mobile);
+
+        final EditText code = new EditText(this);
+        code.setHint(R.string.phone_login_code);
+        code.setInputType(InputType.TYPE_CLASS_NUMBER);
+        code.setSingleLine(true);
+        root.addView(code);
+
+        final TextView status = new TextView(this);
+        status.setText("");
+        status.setTextColor(getColor(R.color.ink2));
+        status.setTextSize(12);
+        status.setPadding(0, dp(6), 0, 0);
+        root.addView(status);
+
+        AlertDialog dialog = dialogBuilder()
+                .setTitle(R.string.phone_login_title)
+                .setView(root)
+                .setNeutralButton(R.string.phone_login_send, null)
+                .setPositiveButton(R.string.phone_login_submit, null)
+                .setNegativeButton(R.string.models_close, null)
+                .create();
+        // AlertDialog 默认按钮会自动关闭：这里接管点击，等结果回来再决定是否关闭。
+        dialog.setOnShowListener(new android.content.DialogInterface.OnShowListener() {
+            @Override
+            public void onShow(android.content.DialogInterface d) {
+                Button sendBtn = dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+                Button okBtn = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+                sendBtn.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        String num = mobile.getText().toString().replaceAll("[^0-9]", "");
+                        if (!num.matches("1[3-9][0-9]{9}")) {
+                            status.setText(R.string.phone_login_bad_mobile);
+                            return;
+                        }
+                        sendBtn.setEnabled(false);
+                        status.setText("正在发送验证码…");
+                        try {
+                            JSONObject body = new JSONObject();
+                            body.put("mobile", num);
+                            body.put("country_code", "86");
+                            if (!sid[0].isEmpty()) {
+                                body.put("sid", sid[0]);
+                            }
+                            phoneLoginRequest("/panel/api/login/phone/send", body,
+                                    new PhoneLoginCb() {
+                                        @Override
+                                        public void onResult(boolean ok, JSONObject data, String error) {
+                                            sendBtn.setEnabled(true);
+                                            if (!ok) {
+                                                status.setText(error);
+                                                return;
+                                            }
+                                            sid[0] = data.optString("sid", sid[0]);
+                                            status.setText(R.string.phone_login_sent);
+                                            code.requestFocus();
+                                        }
+                                    });
+                        } catch (Exception e) {
+                            sendBtn.setEnabled(true);
+                            status.setText(String.valueOf(e.getMessage()));
+                        }
+                    }
+                });
+                okBtn.setOnClickListener(new View.OnClickListener() {
+                    @Override
+                    public void onClick(View v) {
+                        String c = code.getText().toString().replaceAll("[^0-9]", "");
+                        if (c.length() != 6) {
+                            status.setText(R.string.phone_login_bad_code);
+                            return;
+                        }
+                        if (sid[0].isEmpty()) {
+                            status.setText("请先获取验证码");
+                            return;
+                        }
+                        okBtn.setEnabled(false);
+                        status.setText("正在登录…");
+                        try {
+                            JSONObject body = new JSONObject();
+                            body.put("sid", sid[0]);
+                            body.put("code", c);
+                            phoneLoginRequest("/panel/api/login/phone/verify", body,
+                                    new PhoneLoginCb() {
+                                        @Override
+                                        public void onResult(boolean ok, JSONObject data, String error) {
+                                            okBtn.setEnabled(true);
+                                            if (!ok) {
+                                                status.setText(error);
+                                                return;
+                                            }
+                                            toast(getString(R.string.phone_login_done)
+                                                    + (data.optString("nickname", "").isEmpty()
+                                                        ? "" : "：" + data.optString("nickname", "")));
+                                            dialog.dismiss();
+                                            refreshHomeInfo();
+                                        }
+                                    });
+                        } catch (Exception e) {
+                            okBtn.setEnabled(true);
+                            status.setText(String.valueOf(e.getMessage()));
+                        }
+                    }
+                });
+            }
+        });
+        showDialog(dialog);
+    }
+
     private void showSettings() {
         View root = getLayoutInflater().inflate(R.layout.dialog_settings, null);
         final Switch lanSwitch = root.findViewById(R.id.settingsLanSwitch);
+        final Switch panelAuthSwitch = root.findViewById(R.id.settingsPanelAuthSwitch);
+        final View panelAuthRow = root.findViewById(R.id.settingsPanelAuthRow);
         final Switch bootSwitch = root.findViewById(R.id.settingsBootSwitch);
         final Switch notifySwitch = root.findViewById(R.id.settingsNotifySwitch);
         final View lanRow = root.findViewById(R.id.settingsLanRow);
@@ -2054,10 +2340,14 @@ public class MainActivity extends Activity implements GatewayState.Listener {
         final View batteryRow = root.findViewById(R.id.settingsBatteryRow);
 
         lanSwitch.setChecked(Prefs.lan(this));
+        // 面板密码开关的真实状态来自 config.json（panel.require_auth），不是 SharedPreferences
+        // ——它是网关配置的一部分，面板里改配置与这里必须读同一份真相。
+        panelAuthSwitch.setChecked(ServerProcess.readPanelRequireAuth(this));
         bootSwitch.setChecked(Prefs.autoStart(this));
         notifySwitch.setChecked(Prefs.notify(this));
 
         lanRow.setOnClickListener(v -> lanSwitch.setChecked(!lanSwitch.isChecked()));
+        panelAuthRow.setOnClickListener(v -> panelAuthSwitch.setChecked(!panelAuthSwitch.isChecked()));
         bootRow.setOnClickListener(v -> bootSwitch.setChecked(!bootSwitch.isChecked()));
         notifyRow.setOnClickListener(v -> notifySwitch.setChecked(!notifySwitch.isChecked()));
 
@@ -2068,6 +2358,15 @@ public class MainActivity extends Activity implements GatewayState.Listener {
                     @Override
                     public void onClick(android.content.DialogInterface d, int w) {
                         Prefs.setLan(MainActivity.this, lanSwitch.isChecked());
+                        // 面板密码：只在真的变了才落盘（避免每次保存都重写 config.json）
+                        try {
+                            boolean was = ServerProcess.readPanelRequireAuth(MainActivity.this);
+                            if (was != panelAuthSwitch.isChecked()) {
+                                ServerProcess.writePanelRequireAuth(MainActivity.this, panelAuthSwitch.isChecked());
+                            }
+                        } catch (Exception e) {
+                            toast("面板密码开关保存失败：" + e.getMessage());
+                        }
                         Prefs.setAutoStart(MainActivity.this, bootSwitch.isChecked());
                         Prefs.setNotify(MainActivity.this, notifySwitch.isChecked());
                         seeded = false;

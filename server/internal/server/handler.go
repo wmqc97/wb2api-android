@@ -480,9 +480,31 @@ var staticCNModelIDs = []string{
 func staticCNModels() []map[string]any {
 	out := make([]map[string]any, 0, len(staticCNModelIDs))
 	for _, id := range staticCNModelIDs {
-		out = append(out, modelEntry("", upstream.ModelInfo{ID: id}))
+		mi := upstream.ModelInfo{ID: id}
+		// 静态表只有 id：倍率从历史旁表回填，让兜底列表也能显示「×多少」。
+		if c, ok := upstream.ModelCreditsFor("cn", id); ok {
+			mi.Credits = c
+		}
+		out = append(out, modelEntry("", mi))
 	}
 	return out
+}
+
+// fillModelCredits 用历史倍率旁表补齐本轮缺失的 credits（realm 精确匹配）。
+//
+// 上游不是每轮/每个账号都下发倍率（同一模型在不同账号目录里可能带也可能不带），
+// 而倍率是模型属性、不随账号变。缺了就查旁表回填，上游值永远优先——
+// 否则 /v1/models 的 name 只能显示裸模型名，客户端看不出这个模型花多少积分。
+func fillModelCredits(realm string, infos []upstream.ModelInfo) []upstream.ModelInfo {
+	for i := range infos {
+		if infos[i].Credits != "" {
+			continue
+		}
+		if c, ok := upstream.ModelCreditsFor(realm, infos[i].ID); ok {
+			infos[i].Credits = c
+		}
+	}
+	return infos
 }
 
 // dynamicModelsCache 动态模型缓存。
@@ -522,8 +544,16 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // （上游动态值权威 → 知识表），**未知即省略字段**：旧实现在这里兜底 131072 是编造值，
 // 会让按 context_length 决策的客户端（Codex/ZCode 等）提前截断、白白丢上下文。
 func modelEntry(prefix string, mi upstream.ModelInfo) map[string]any {
+	// id 末尾拼「|×倍率」展示后缀：只读 id 的客户端也能看到倍率。
+	// 网关在 resolve_model.go 的 stripPriceSuffix 里剥掉它，调用口径不受影响。
+	id := prefix + mi.ID
+	if idPriceSuffixOn.Load() {
+		if sfx := priceSuffix(mi.Credits); sfx != "" {
+			id += sfx
+		}
+	}
 	entry := map[string]any{
-		"id":       prefix + mi.ID,
+		"id":       id,
 		"object":   "model",
 		"created":  1753600000,
 		"owned_by": "workbuddy",
@@ -553,7 +583,77 @@ func modelEntry(prefix string, mi upstream.ModelInfo) map[string]any {
 	if mi.Credits != "" {
 		entry["credits"] = mi.Credits
 	}
+	// name：对外展示名，把倍率拼进模型名（「deepseek-v4.1-flash · ×0.25」）。
+	// 参考实现（admin/model_listing.py 的 format_entries）就是这么做的——客户端列表里
+	// 一眼能看出这个模型花多少积分，不用逐个点进面板对照。
+	// **id 保持裸模型名不变**：客户端配置里用的就是 id，拼倍率进去会让已有配置失效。
+	entry["name"] = modelDisplayName(mi.ID, mi.Credits, mi.SupportsImages)
 	return entry
+}
+
+// idPriceSuffixOn 控制「/v1/models 的模型 id 是否拼倍率展示后缀」。
+//
+// **默认关闭**：倍率只写进 name，**不改 id**。
+//
+// 曾经默认开启（把 "|×0.79" 拼进 id，让只读 id 的客户端也能看到倍率），但实测有
+// 真实代价：第三方客户端会拿 id 做严格校验/编码/本地白名单，带 "|" 与 "×" 的模型名
+// 会被判为非法模型 → 表现为「模型列表能拉到，但调用连不上」。协议层污染换来的
+// 展示收益不值这个风险，故回到参考项目的做法：id 保持上游原样，倍率放 name。
+//
+// 需要时可用 config models.id_multiplier_suffix=true 打开（网关入站会剥离后缀，
+// resolve_model.go 的 stripPriceSuffix），但默认不开。
+var idPriceSuffixOn atomic.Bool
+
+func init() { idPriceSuffixOn.Store(false) }
+
+// SetIDPriceSuffix 注入开关（main 启动时按配置调用；面板改配置后热生效）。
+func SetIDPriceSuffix(on bool) {
+	idPriceSuffixOn.Store(on)
+	// 写死条目（PinnedModel.Entry）走 upstream 侧的开关：两侧必须同步，
+	// 否则同一份 /v1/models 列表里会出现「带后缀」与「不带后缀」两种 id。
+	upstream.SetIDPriceSuffix(on)
+}
+
+// IDPriceSuffixEnabled 报告当前开关状态（测试/运维观测）。
+func IDPriceSuffixEnabled() bool { return idPriceSuffixOn.Load() }
+
+// priceSuffix 把上游倍率原文转成 id 展示后缀（"|×0.79" / "|×未知"）。
+//
+// 返回 "" 表示不加后缀（仅 id 为空这种异常情形）。与 name 里的 " · ×0.79" 同源，
+// 区别只是分隔符：id 里的 "|" 可无歧义剥离，name 里用 " · " 更适合阅读。
+func priceSuffix(credits string) string {
+	c := strings.TrimSpace(credits)
+	c = strings.TrimPrefix(strings.TrimPrefix(c, "x"), "X")
+	if c == "" {
+		return "" // 拿不到倍率：id 也不拼后缀
+	}
+	return priceSuffixSep + c
+}
+
+// modelDisplayName 外部调用的模型展示名：<模型 id> · ×<倍率>。
+//
+// 倍率缺失（上游没给 credits）时不拼后缀，保持裸名——满屏「×未知」只是噪音，
+// 与「不给倍率就不显示」的既有面板口径一致。
+// 上游倍率形如 "x0.25"（也可能是 "X0.25"/"0.25"），统一去掉前缀 x 再拼 ×。
+func modelDisplayName(id, credits string, images bool) string {
+	id = strings.TrimSpace(id)
+	c := strings.TrimSpace(credits)
+	c = strings.TrimPrefix(strings.TrimPrefix(c, "x"), "X")
+	if id == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(id)
+	// 上游这轮没下发倍率 → **不显示倍率**（不写「×未知」占位）。
+	if c != "" {
+		b.WriteString(" · ×" + c)
+	}
+	// 图片能力也写进展示名：客户端列表里只显示 name，不给标识就只能一个个猜
+	// （用户原话：「不然我都不知道哪些可以图片处理」）。不支持的不加后缀，避免噪音。
+	if images {
+		b.WriteString(" · 可传图")
+	}
+	return b.String()
 }
 
 // globalModels 国际版（global realm）模型名静态名单（PLAN §7.2 附录 21 名）。
@@ -590,6 +690,7 @@ func (h *Handler) modelList() []map[string]any {
 		if cnOn {
 			infos = h.fetchDynamicModels() // 只在有 CN 账号时才打上游
 		}
+		infos = fillModelCredits("cn", infos)
 		infos = h.cfg.HiddenModels.FilterInfo(infos)
 		if len(infos) > 0 {
 			for _, mi := range infos {
@@ -624,6 +725,25 @@ func (h *Handler) modelList() []map[string]any {
 			if pm, ok := pinnedByID[mi.ID]; ok {
 				entry = pm.Entry() // 完整快照覆盖（含倍率 / 档位）
 			}
+			// 展示名补倍率：global 目录在 GetGlobalModelInfos 里已把 credits 摘进旁表
+			// （PLAN §3.D2：倍率不进路由/列表**字段**口径），所以这里从旁表取，
+			// 只写 name、绝不回填 credits 字段——客户端不会因为多了个 credits 字段
+			// 而改变路由/计费判断，列表里却能直接看到「×多少」。
+			if c, ok := upstream.ModelCreditsFor("global", mi.ID); ok {
+				base := mi.Name
+				if base == "" {
+					base = mi.ID
+				}
+				entry["name"] = modelDisplayName(base, c, mi.SupportsImages)
+				// id 的后缀必须与 name 同源（倍率旁表），但**只有开关打开时才改 id**：
+				// 默认关闭时 id 必须保持上游裸名，否则第三方客户端会拿到带 "|×" 的
+				// 非法模型名（用户实测「模型列表能拉到，但调用连不上」）。
+				if idPriceSuffixOn.Load() {
+					if cur, _ := entry["id"].(string); cur != "" {
+						entry["id"] = stripPriceSuffix(cur) + priceSuffix(c)
+					}
+				}
+			}
 			glEntries = append(glEntries, realmEntry{"global", entry})
 		}
 	}
@@ -638,12 +758,17 @@ func (h *Handler) modelList() []map[string]any {
 	for _, group := range [2][]realmEntry{first, second} {
 		for _, re := range group {
 			id, _ := re.entry["id"].(string)
-			if id == "" || seen[id] {
+			// 去重必须按**剥掉倍率后缀的裸 id**：带上 "|×0.79" 之后两域同名模型的
+			// id 字符串不再相等（CN 与 global 的倍率可能不同），按原样去重会漏判
+			// → 同一模型在列表里出现两次（一个 ×0.79、一个 ×未知）。
+			bareID := stripPriceSuffix(id)
+			if bareID == "" || seen[bareID] {
 				continue
 			}
-			seen[id] = true
+			seen[bareID] = true
 			if !h.cfg.StripRealmPrefix {
-				// 保留历史协议：id 标回所属域前缀。
+				// 保留历史协议：id 标回所属域前缀（前缀在倍率后缀之外：
+				// "cn:glm-5.2|×0.79"，入站先剥前缀再剥后缀）。
 				e := make(map[string]any, len(re.entry))
 				for k, v := range re.entry {
 					e[k] = v
@@ -698,7 +823,16 @@ func (h *Handler) fetchGlobalModelInfos() []upstream.ModelInfo {
 	// 用户最需要看清"还剩什么免费模型"的时刻。理由与取舍见 internal/pool/reserve.go 文件头。
 	acct := h.cfg.Pool.PickExcludingForRealmMeta(nil, "global")
 	if acct == nil {
-		// 无 global 账号：输出静态名单（仅 ID，元数据留空），零上游调用。
+		// 该域账号全部烧光（硬冷却）时仍然要能拉目录：拉模型列表是只读操作、不扣积分，
+		// 而静态名单没有倍率/窗口/能力——用户此时看到的正是「模型列表不能获取/没有价格」。
+		acct = h.cfg.Pool.PickForCatalog("global")
+	}
+	if acct == nil {
+		// 连被停用的号也借一把：拉目录是只读的，停用 ≠ token 失效。
+		acct = h.cfg.Pool.PickForCatalogAny("global")
+	}
+	if acct == nil {
+		// 真的没有该域账号：输出静态名单（仅 ID，元数据留空），零上游调用。
 		out := make([]upstream.ModelInfo, 0, len(globalModels))
 		for _, id := range globalModels {
 			if id = strings.TrimSpace(id); id != "" {
@@ -730,9 +864,14 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 		return out
 	}
 	// 失败负缓存：冷却期内不再请求上游。
+	//
+	// 但**不能直接返回 nil**：nil 会让 /v1/models 退化成静态兜底表（没有倍率、没有
+	// 真实窗口/能力），用户看到的就是「模型列表里一堆模型都没有价格」。有上次成功
+	// 的快照就照旧用（最多滞后，但数据真实），只有从未成功过才回落静态表。
 	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
+		stale := dynamicModelsCache.ids
 		dynamicModelsCache.RUnlock()
-		return nil
+		return stale
 	}
 	dynamicModelsCache.RUnlock()
 
@@ -757,6 +896,14 @@ func fetchCNCatalogAndCache(up *upstream.Client, p *pool.Pool) []upstream.ModelI
 		return nil
 	}
 	acct := p.PickExcludingForRealmMeta(nil, "cn")
+	if acct == nil {
+		// 同 global：余额烧光的号也能拉目录（只读、不扣积分），否则公开 /v1/models
+		// 会退化成静态表——没有倍率、没有真实窗口。
+		acct = p.PickForCatalog("cn")
+	}
+	if acct == nil {
+		acct = p.PickForCatalogAny("cn")
+	}
 	if acct == nil {
 		return nil
 	}

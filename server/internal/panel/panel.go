@@ -69,6 +69,11 @@ type Config struct {
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
 
+	// GrowthStateFile 成长计划快照/记录/幂等台账的落盘路径基准。
+	// 与 state.json 同目录（App 私有 data/），由 cmd/server 注入 cfg.StateFile；
+	// 空 = 当前目录 growth_plan.json（仅供单测）。
+	GrowthStateFile string
+
 	// HiddenModels 对外隐藏的模型名，与 /v1/models 同口径（同一份 upstream.HiddenSet）。
 	// nil = 不隐藏。
 	HiddenModels upstream.HiddenSet
@@ -101,6 +106,14 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// 成长计划（growth_center.go）：快照/巡检/手动动作。按需装配，
+	// 无 Pool/Upstream 的单测面板不创建状态文件。
+	gc *growthCenter
+
+	// 定时任务（schedules.go）：参考项目 /api/schedules 的 Go 版，
+	// data/schedules.json 持久化，15 秒 ticker 轮询到期任务。
+	sm *ScheduleManager
 
 	setupMu      sync.Mutex
 	setupQueue   []*auth.Auth
@@ -156,6 +169,10 @@ func New(cfg Config) *Panel {
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
 	}
+	if cfg.Pool != nil && cfg.Upstream != nil {
+		p.gc = newGrowthCenter(p, cfg.GrowthStateFile)
+		p.sm = newScheduleManager(p, cfg.GrowthStateFile)
+	}
 	p.routes()
 	return p
 }
@@ -166,6 +183,9 @@ func (p *Panel) Logs() *Ring { return p.logs }
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	p.mux.HandleFunc("GET /panel/growth_center.css", p.growthCenterCSSHandler)
+	p.mux.HandleFunc("GET /panel/growth_center.js", p.growthCenterJSHandler)
+	p.mux.HandleFunc("GET /panel/schedules.js", p.schedulesJSHandler)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
@@ -176,6 +196,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
+	// 手机号 + 短信验证码登录（phone_login.go）：面板弹窗内直接输入手机号收码登录，
+	// 不跳官方授权页（手机浏览器走不到 workbuddy:// 回调）。sid 为空时 send 会先建会话。
+	p.mux.HandleFunc("POST /panel/api/login/phone/send", p.withAuth(p.phoneLoginSend))
+	p.mux.HandleFunc("POST /panel/api/login/phone/verify", p.withAuth(p.phoneLoginVerify))
+	p.mux.HandleFunc("GET /panel/api/login/phone/status", p.withAuth(p.phoneLoginStatus))
 	// cockpit tools 导出 JSON 批量导入（吸收上游 9371f7d）：Add Account 的
 	// 「导入 JSON」标签页落点。写操作（落盘 + 进池）→ 同 withAuth。
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
@@ -214,11 +239,32 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("POST /panel/api/cooldown_probe/run", p.withAuth(p.cooldownProbeRun))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	// 积分到期（credits_expiry.go）：逐包到期明细 + 账号级到期排行，按「最先作废」排序。
+	// badge 走池内已同步的快过架子集（不打上游），供侧栏角标使用。
+	p.mux.HandleFunc("GET /panel/api/credits/expiry", p.withAuth(p.creditsExpiry))
+	p.mux.HandleFunc("GET /panel/api/credits/badge", p.withAuth(p.creditExpiryBadge))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// 成长计划（参考项目 admin/routers/growth_center.py + growth_plan.py）：
+	// 快照页面全部只读；写动作 refresh/action/run 才打上游。
+	p.mux.HandleFunc("GET /panel/api/growth/accounts", p.withAuth(p.growthAccountsHandler))
+	p.mux.HandleFunc("GET /panel/api/growth/accounts/{uid}", p.withAuth(p.growthOverview))
+	p.mux.HandleFunc("POST /panel/api/growth/accounts/{uid}/refresh", p.withAuth(p.growthRefresh))
+	p.mux.HandleFunc("GET /panel/api/growth/accounts/{uid}/records", p.withAuth(p.growthRecords))
+	p.mux.HandleFunc("GET /panel/api/growth/accounts/{uid}/official", p.withAuth(p.growthOfficial))
+	p.mux.HandleFunc("POST /panel/api/growth/accounts/{uid}/action", p.withAuth(p.growthAction))
+	p.mux.HandleFunc("POST /panel/api/growth/run", p.withAuth(p.growthRun))
+	p.mux.HandleFunc("GET /panel/api/growth/status", p.withAuth(p.growthStatus))
+	p.mux.HandleFunc("GET /panel/api/schedules", p.withAuth(p.schedulesList))
+	p.mux.HandleFunc("POST /panel/api/schedules", p.withAuth(p.schedulesCreate))
+	p.mux.HandleFunc("PATCH /panel/api/schedules/{id}", p.withAuth(p.schedulesPatch))
+	p.mux.HandleFunc("POST /panel/api/schedules/{id}/toggle", p.withAuth(p.schedulesToggle))
+	p.mux.HandleFunc("POST /panel/api/schedules/{id}/run", p.withAuth(p.schedulesRun))
+	p.mux.HandleFunc("DELETE /panel/api/schedules/{id}", p.withAuth(p.schedulesDelete))
+	p.mux.HandleFunc("GET /panel/api/schedules/status", p.withAuth(p.schedulesStatus))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -233,6 +279,13 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 即用新值（无需重启）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 面板免密开关（config panel.require_auth=false）：只对 /panel/* 放行。
+		// /v1/* 的鉴权在 internal/server 侧独立进行，不读这个开关——关掉面板密码
+		// 不会让 API 变成无鉴权（那才是最危险的那种"顺手关了"）。
+		if p.cfg.Live != nil && p.cfg.Live.Load().PanelAuthDisabled {
+			next(w, r)
+			return
+		}
 		if !httpauth.VerifyBearer(r, p.apiKey()) {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
@@ -366,8 +419,20 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	// "还剩什么免费模型"的时刻。理由见 internal/pool/reserve.go 文件头。
 	acct := p.cfg.Pool.PickExcludingForRealmMeta(nil, realm)
 	if acct == nil {
+		// 该域没有「健康」账号时不要立刻报错：模型目录是只读接口，不消费积分，
+		// 余额烧光（硬冷却）的号照样能拉目录。放宽到该域任意未禁用账号，否则用户
+		// 在最需要看清「还剩什么模型、多少钱」的时刻反而打不开（也就是
+		// 「没有可用的 global 账号」这个报错的由来）。
+		acct = p.cfg.Pool.PickForCatalog(realm)
+	}
+	if acct == nil {
+		// 连被停用的号也借一把：拉目录是只读的（不扣积分、不改状态），
+		// 停用通常只是"不想要它的流量"，不代表 token 读不了目录。
+		acct = p.cfg.Pool.PickForCatalogAny(realm)
+	}
+	if acct == nil {
 		writeErr(w, http.StatusServiceUnavailable,
-			"没有可用的 "+realm+" 账号：请先在面板添加账号再查询")
+			"没有 "+realm+" 域的账号：请先在面板添加该域账号再查询")
 		return
 	}
 	// 国际站模型目录在 /v2 家族（/console 家族返回 500 网关错误页）——由
@@ -406,7 +471,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	for _, mi := range infos {
 		entry := map[string]any{
 			"id":                   mi.ID,
-			"name":                 mi.Name,
+			"name":                 panelModelName(mi),
 			"context_length":       mi.ContextWindow,
 			"max_output_tokens":    mi.MaxTokens,
 			"max_allowed_size":     mi.MaxAllowedSize,
@@ -468,6 +533,9 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"raw_model_ids": nonNil(diag.RawModelIDs),
 			"all_model_ids": nonNil(diag.AllModelIDs),
 			"dropped":       nonNil(diag.Dropped),
+			// dropped_alias：dropped 里属于路由别名的那部分（auto/default/fast-model…），
+			// 前端据此把「别名」与「真的没授权」分开解释，避免用户以为网关漏了模型。
+			"dropped_alias": nonNil(diag.DroppedAlias),
 			// v3_only_ids：企业端点没有、靠 /v3/config 追加进目录的 id。与 dropped
 			// 配对读能回答"某模型为什么不在列表里"的全部成因（上游没给 / 被筛掉 /
 			// 追加步失效——重写前面板路径缺追加步，这批 id 全部不可见）。
@@ -499,10 +567,51 @@ func (p *Panel) realmServable(realm string) bool {
 // 与 models handler 的内联回退等价，抽出来是为了让 realm_servable 的判据能复用
 // 同一份知识（见 realmServable）。
 func (p *Panel) defaultRealm() string {
+	// 优先按「**可用**账号」决定默认域，其次才看「有没有账号」。
+	//
+	// 为什么：原实现只看 HasRealm，于是「global 账号全部被停用/余额烧光」时，
+	// 面板仍默认请求 global → 直接报「没有 global 域的账号」，而用户池里明明有
+	// 一堆健康的 CN 号（实测就是这一切：两个 global 号 credits=0 且被手动停用，
+	// 打开「模型与档位」必现报错）。交互默认值应该跟着"现在能干活的账号"走。
+	usableCN, usableGL := p.cfg.Pool.HasUsableRealm("cn"), p.cfg.Pool.HasUsableRealm("global")
+	if usableCN && !usableGL {
+		return "cn"
+	}
+	if usableGL && !usableCN {
+		return "global"
+	}
+	if usableCN && usableGL {
+		return "global" // 两域都可用：沿用既有默认（国际版优先）
+	}
+	// 两域都没有可用账号：退回「有没有账号」判定，保持旧行为。
 	if p.cfg.Pool.HasRealm("cn") && !p.cfg.Pool.HasRealm("global") {
 		return "cn"
 	}
 	return "global"
+}
+
+// panelModelName 面板「模型与档位」的展示名：上游显示名 + " · ×倍率"。
+//
+// 与 /v1/models 的 modelDisplayName 同一口径（参考实现 admin/model_listing.py 的
+// format_entries 就是把倍率拼进 name）。面板另有独立的「积分倍率」列，但名称里带
+// 倍率便于一眼扫表与直接复制；上游没给倍率时不拼后缀（不制造"×未知"噪音）。
+func panelModelName(mi upstream.ModelInfo) string {
+	name := strings.TrimSpace(mi.Name)
+	if name == "" {
+		name = mi.ID
+	}
+	c := strings.TrimSpace(mi.Credits)
+	c = strings.TrimPrefix(strings.TrimPrefix(c, "x"), "X")
+	// 上游这轮没给倍率：直接不显示倍率片段（不写「×未知」）。
+	if c != "" {
+		name += " · ×" + c
+	}
+	// 能力也写进展示名：面板表里已经有独立的「图片」列，但名称本身带标识更方便
+	// 一眼扫表与复制粘贴（与 /v1/models 的 name 同口径）。
+	if mi.SupportsImages {
+		name += " · 可传图"
+	}
+	return name
 }
 
 // realmPrefixedID 拼「realm 前缀 + 裸 id」的完整模型名（面板显示与复制用）。
@@ -1056,6 +1165,14 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 		Size     int64                    `json:"size"`
 		Packages []upstream.CreditPackage `json:"packages"`
 		Error    string                   `json:"error,omitempty"`
+		// 账号状态：安卓「积分明细」列表与网页账号池共用同一份口径，
+		// 让移动端能标出「停用/冻结/冷却中」，而不是只看到一个余额数字。
+		Disabled       bool   `json:"disabled"`
+		ManualDisabled bool   `json:"manual_disabled"`
+		Cooling        bool   `json:"cooling"`
+		CoolKind       string `json:"cool_kind,omitempty"`
+		DisabledReason string `json:"disabled_reason,omitempty"`
+		ManualReason   string `json:"manual_reason,omitempty"`
 	}
 	out := make([]row, len(accts))
 
@@ -1068,7 +1185,10 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm,
+				Disabled: s.Disabled, ManualDisabled: s.ManualDisabled,
+				Cooling: s.Cooling, CoolKind: s.CoolKind,
+				DisabledReason: s.DisabledReason, ManualReason: s.ManualReason}
 			a := p.cfg.Pool.AuthByUID(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"
